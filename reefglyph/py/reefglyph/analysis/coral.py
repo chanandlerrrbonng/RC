@@ -6,15 +6,17 @@ from ..codec.layers import CoralRecord
 PARAMS = dict(L_t=60.0, C_t=25.0, tau=0.35, norm=0, seg="gc")   # overwritten by data/params.json
 MAXS = 320                                                       # analysis resolution (longest side)
 HEALTH_EDGES = None                               # 5 ascending edges from the calibration split
+TEXTURE_EDGES = None                              # 15 ascending edges from the calibration split
 
 
 def load_params(path="data/params.json"):
     """Called automatically at import if data/params.json exists (run from project root)."""
-    global HEALTH_EDGES
+    global HEALTH_EDGES, TEXTURE_EDGES
     if os.path.exists(path):
         d = json.load(open(path))
         PARAMS.update({k: d[k] for k in d if k in PARAMS})
         HEALTH_EDGES = d.get("health_edges")
+        TEXTURE_EDGES = d.get("texture_edges")
 
 
 load_params()
@@ -78,6 +80,19 @@ def bleach_index(bgr, mask, p=PARAMS):
     return bleach_from_stats(Ls, C, p), er
 
 
+def texture_index(bgr, er):
+    """Mean Scharr gradient magnitude of chroma inside the eroded mask -> 0..15 level."""
+    L, a, b = to_lab(bgr)
+    C_2d = np.hypot(a, b).astype(np.float32)
+    gx = cv2.Scharr(C_2d, cv2.CV_32F, 1, 0)
+    gy = cv2.Scharr(C_2d, cv2.CV_32F, 0, 1)
+    mag = np.hypot(gx, gy)
+    val = float(mag[er > 0].mean()) if (er > 0).any() else 0.0
+    if TEXTURE_EDGES is None:
+        return 7, val
+    return int(np.clip(np.searchsorted(TEXTURE_EDGES, val), 0, 15)), val
+
+
 def analyze(bgr, rect, normalise=None, params=PARAMS, with_evidence=True):
     """rect = (x, y, w, h). Returns CoralRecord."""
     s = MAXS / max(bgr.shape[:2])
@@ -89,6 +104,7 @@ def analyze(bgr, rect, normalise=None, params=PARAMS, with_evidence=True):
     Ls, C, er = pixel_stats(bgr, mask)
     bi = bleach_from_stats(Ls, C, params)
     r = CoralRecord(bleach=bi, health=min(6, max(1, health_score(health_x(Ls, C)))), morph=3)
+    r.texture, _ = texture_index(bgr, er)
     r.evidence = int(bi > params["tau"])
     px = bgr[er > 0].astype(np.float32)
     cols = median_cut(px, 2)

@@ -68,5 +68,12 @@ if __name__ == "__main__":
     np.savez("data/scores.npz", s=sh, y=y[ih])                      # held-out scores for eval/triage.py
     xs = [coral.health_x(L, C) for L, C in pick(S, ic)]
     edges = [float(v) for v in np.quantile(xs, [i / 6 for i in range(1, 6)])]
-    json.dump(dict(L_t=Lt, C_t=Ct, tau=tau, health_edges=edges, norm=k[1], seg=k[0]),
+    txs = []
+    for j in ic:
+        S_j = V[k][j]; L_j, C_j = S_j
+        C_2d = np.hypot(np.zeros_like(C_j), C_j).astype(np.float32).reshape(-1, 1)
+        gx = cv2.Scharr(C_2d, cv2.CV_32F, 1, 0); gy = cv2.Scharr(C_2d, cv2.CV_32F, 0, 1)
+        txs.append(float(np.hypot(gx, gy).mean()))
+    texture_edges = [float(v) for v in np.quantile(txs, [(i + 1) / 16 for i in range(15)])]
+    json.dump(dict(L_t=Lt, C_t=Ct, tau=tau, health_edges=edges, texture_edges=texture_edges, norm=k[1], seg=k[0]),
               open("data/params.json", "w")); print("saved data/params.json, data/scores.npz")

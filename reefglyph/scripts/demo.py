@@ -31,7 +31,7 @@ for d, c in ((1000, 3.3), (1037, -5.6), (1000, 0.0)):
 
 # 1) noiseless loopback must be exact
 fr, info = phy.demodulate(audio); assert all(f.ok for f in fr) and len(fr) == 9, "noiseless loopback failed"
-assert (np.concatenate([f.payload for f in fr[:1]])[:76] == layers[0]).all()
+assert (np.concatenate([f.payload for f in fr[:1]])[:80] == layers[0]).all()
 print("noiseless OK, sync:", info)
 
 # 2) impaired: noise + delay + multipath + +-100 ppm

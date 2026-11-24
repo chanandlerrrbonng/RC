@@ -28,6 +28,6 @@ def render_glyph(r, S=256):
         img[y0:y0 + h, x0:x0 + w] = box
     col = (0, 0, 255) if r.bleach > 0.3 else (0, 160, 0)    # bleach badge
     cv2.rectangle(img, (0, 0), (S, 22), col, -1)
-    cv2.putText(img, f"coral {r.coral} bleach {r.bleach:.2f} H{r.health}", (4, 16),
+    cv2.putText(img, f"coral {r.coral} bleach {r.bleach:.2f} H{r.health} T{r.texture}", (4, 16),
                 cv2.FONT_HERSHEY_SIMPLEX, .5, (255, 255, 255), 1)
     return img

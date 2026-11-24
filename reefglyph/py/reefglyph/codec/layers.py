@@ -26,7 +26,7 @@ class CoralRecord:
     transect: int = 0; coral: int = 0; depth_m: float = 0.0; time_s: float = 0.0
     bleach: float = 0.0; health: int = 1; morph: int = 3     # 0 branching 1 massive 2 plate 3 other
     colors: list = field(default_factory=lambda: [(50, 0, 0), (50, 0, 0)])
-    patch: int = 0; evidence: int = 0
+    patch: int = 0; evidence: int = 0; texture: int = 0
     efd: np.ndarray = None      # (8,4) in unit box
     locus: tuple = (0.5, 0.5); aspect: float = 1.0
     thumb: np.ndarray = None    # 16x16 ints 0..3
@@ -38,8 +38,8 @@ def pack_L0(r):
          (_q(r.bleach, 0, 1, 6), 6), (r.health - 1, 3), (r.morph, 2)]
     for c in r.colors:
         q = lab_q(c); f += [(q[0], 6), (q[1], 5), (q[2], 5)]
-    f += [(r.patch, 1), (r.evidence, 1)]
-    out = np.concatenate([i2b(v, n) for v, n in f]); assert len(out) == 76
+    f += [(r.patch, 1), (r.evidence, 1), (int(np.clip(r.texture, 0, 15)), 4)]
+    out = np.concatenate([i2b(v, n) for v, n in f]); assert len(out) == 80
     return out
 
 
@@ -54,6 +54,7 @@ def unpack_L0(bits):
     r.bleach = _dq(rd(6), 0, 1, 6); r.health = rd(3) + 1; r.morph = rd(2)
     r.colors = [lab_dq([rd(6), rd(5), rd(5)]) for _ in range(2)]
     r.patch, r.evidence = rd(1), rd(1)
+    r.texture = rd(4)
     return r
 
 
