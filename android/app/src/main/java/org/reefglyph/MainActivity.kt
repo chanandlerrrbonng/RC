@@ -54,12 +54,12 @@ object ReefSpec {
     const val N_DOWN = 2
     const val PREAMBLE_SYMS = N_UP + N_DOWN // 10
 
-    const val HDR_BITS = 16 // 16-bit (2-byte) header alignment
+    const val HDR_BITS = 16
     const val PAY_BITS = 108
     const val CRC_BITS = 16
     const val FRAME_BITS = HDR_BITS + PAY_BITS + CRC_BITS // 140
 
-    const val L0_BITS = 80 // 80 bits (includes 4-bit texture index)
+    const val L0_BITS = 80 // includes 4-bit texture index
     const val L1_BITS = 175
     const val L2_BITS = 576
     const val ACK_BITS = 28
@@ -293,7 +293,6 @@ object BitChain {
         return r
     }
 
-    // Pack 140-bit frame (16B header + 108B payload + 16B CRC)
     fun packFrame(f: ModemFrame): IntArray {
         val b = ArrayList<Int>()
         fun add(v: Int, n: Int) {
@@ -307,7 +306,7 @@ object BitChain {
         System.arraycopy(f.payload, 0, pay, 0, min(f.payload.size, ReefSpec.PAY_BITS))
         for (x in pay) b.add(x)
 
-        val body = b.toIntArray() // 124 bits
+        val body = b.toIntArray()
         val crc = crc16(body)
         val crcBits = ReefSpec.intToBits(crc, 16)
         val out = IntArray(140)
@@ -316,7 +315,6 @@ object BitChain {
         return out
     }
 
-    // Unpack 140-bit frame with strict 16-bit header alignment check
     fun unpackFrame(bits: IntArray): ModemFrame {
         if (bits.size < 140) return ModemFrame(0, 0, 0, 0, IntArray(0), false)
         val body = bits.copyOfRange(0, 124)
@@ -334,7 +332,44 @@ object BitChain {
 }
 
 // ============================================================================
-// 3. PHY MODULATION & DEMODULATION ENGINE (WITH JTRANSFORMS FFT)
+// 3. ZERO-ALLOCATION AUDIO RING BUFFER (Thread-safe, 6-second circular memory)
+// ============================================================================
+class AudioRingBuffer(val capacity: Int) {
+    private val buf = FloatArray(capacity)
+    private var writePos = 0
+    private var totalCount = 0
+
+    @Synchronized
+    fun write(data: ShortArray, len: Int) {
+        for (i in 0 until len) {
+            buf[writePos] = data[i] / 32768.0f
+            writePos = (writePos + 1) % capacity
+            if (totalCount < capacity) totalCount++
+        }
+    }
+
+    @Synchronized
+    fun snapshot(): FloatArray {
+        val out = FloatArray(totalCount)
+        val start = (writePos - totalCount + capacity) % capacity
+        for (i in 0 until totalCount) {
+            out[i] = buf[(start + i) % capacity]
+        }
+        return out
+    }
+
+    @Synchronized
+    fun size(): Int = totalCount
+
+    @Synchronized
+    fun clear() {
+        writePos = 0
+        totalCount = 0
+    }
+}
+
+// ============================================================================
+// 4. PHY MODULATION & DEMODULATION ENGINE
 // ============================================================================
 data class SyncResult(
     val start: Int,
@@ -416,7 +451,7 @@ object ModemPhy {
         return audio
     }
 
-    // Downsamples 48 kHz passband to 3 kHz complex baseband (16 samples per baseband sample)
+    // Precise phase-preserving baseband downconversion (OSR = 16 integrate-and-dump decimation)
     fun toBaseband(audio: FloatArray): Pair<DoubleArray, DoubleArray> {
         val nOut = audio.size / ReefSpec.OSR
         val bbRe = DoubleArray(nOut)
@@ -439,7 +474,6 @@ object ModemPhy {
         return Pair(bbRe, bbIm)
     }
 
-    // Dechirp FFT peak detector with quadratic interpolation
     fun dechirpPeak(
         bbRe: DoubleArray, bbIm: DoubleArray, start: Int,
         ref: Array<DoubleArray>, sf: Int
@@ -451,7 +485,6 @@ object ModemPhy {
             val sIm = bbIm[start + n]
             val rRe = ref[n][0]
             val rIm = ref[n][1]
-            // seg * ref
             fftBuf[2 * n] = sRe * rRe - sIm * rIm
             fftBuf[2 * n + 1] = sRe * rIm + sIm * rRe
         }
@@ -484,12 +517,12 @@ object ModemPhy {
     private fun sw(v: Double, n: Double): Double =
         ((v + n / 2.0).mod(n) + n).mod(n) - n / 2.0
 
-    // Full sliding-dechirp preamble synchronization (CFO and timing estimation matching phy.py)
-    fun sync(bbRe: DoubleArray, bbIm: DoubleArray, sf: Int = ReefSpec.DEFAULT_SF, thr: Double = 5.0): SyncResult? {
+    // Robust sliding-dechirp sync tuned for distance and multipath
+    fun sync(bbRe: DoubleArray, bbIm: DoubleArray, sf: Int = ReefSpec.DEFAULT_SF): SyncResult? {
         val N = 1 shl sf
         val up = baseChirp(sf)
-        val cu = Array(N) { i -> doubleArrayOf(up[i][0], -up[i][1]) } // conj(up)
-        val cd = up // downchirp conjugate is upchirp
+        val cu = Array(N) { i -> doubleArrayOf(up[i][0], -up[i][1]) }
+        val cd = up
 
         val nw = bbRe.size / N
         if (nw < 16) return null
@@ -499,20 +532,20 @@ object ModemPhy {
             pks.add(dechirpPeak(bbRe, bbIm, g * N, cu, sf))
         }
 
-        // Look for 4 consecutive up-chirp peaks
+        // Lock condition: 4 consecutive up-chirp peaks with aligned bins
         var g0: Int? = null
         for (g in 0 until (nw - 4)) {
             val w = (0 until 4).map { pks[g + it] }
-            if (w.all { it.second > thr } &&
-                w.all { abs(sw(it.first - w[0].first, N.toDouble())) < 2.5 }) {
+            val avgRatio = w.map { it.second }.average()
+            if (avgRatio > 3.2 && w.all { it.second > 2.0 } &&
+                w.all { abs(sw(it.first - w[0].first, N.toDouble())) < 3.0 }) {
                 g0 = g
                 break
             }
         }
         if (g0 == null) return null
 
-        // Fractional symbol start alignment 'a'
-        var a = Math.floorMod(Math.rint(g0 * N - sw(pks[g0].first, N.toDouble())).toLong(), N.toLong()).toInt()
+        var a = Math.rint(g0 * N - sw(pks[g0].first, N.toDouble())).toInt()
         while (a < 0) a += N
 
         // Search for down-chirp marker (iD)
@@ -522,7 +555,7 @@ object ModemPhy {
             if (s + N > bbRe.size) return null
             val ru = dechirpPeak(bbRe, bbIm, s, cu, sf).second
             val rd = dechirpPeak(bbRe, bbIm, s, cd, sf).second
-            if (rd > ru && rd > thr) {
+            if (rd > ru && rd > 2.2) {
                 iD = i
                 break
             }
@@ -544,7 +577,6 @@ object ModemPhy {
         return SyncResult(start, cfo, tau, snrDb)
     }
 
-    // Demodulate F0 (40 symbols) with CFO derotation
     fun demodulateF0(
         bbRe: DoubleArray, bbIm: DoubleArray,
         syncResult: SyncResult, sf: Int = ReefSpec.DEFAULT_SF
@@ -554,7 +586,6 @@ object ModemPhy {
         val cu = Array(N) { i -> doubleArrayOf(up[i][0], -up[i][1]) }
         val nSyms = ReefSpec.frameSymbols(sf, true) // 40 symbols
 
-        // CFO Derotation: bb * exp(-2j * pi * cfo * n / N)
         val derotRe = DoubleArray(bbRe.size)
         val derotIm = DoubleArray(bbIm.size)
         for (n in bbRe.indices) {
@@ -579,7 +610,7 @@ object ModemPhy {
 }
 
 // ============================================================================
-// 4. MAIN ACTIVITY & LIVE FULL-DUPLEX CONTROLLER
+// 5. MAIN ACTIVITY & CONTROLLER
 // ============================================================================
 class MainActivity : ComponentActivity() {
 
@@ -759,8 +790,7 @@ class MainActivity : ComponentActivity() {
         try {
             audioRecord.startRecording()
             val chunk = ShortArray(4800) // 100 ms chunks
-            val rollingSamples = ArrayList<Float>()
-            val maxRolling = sampleRate * 4 // 4s buffer
+            val ringBuffer = AudioRingBuffer(sampleRate * 6) // 6s circular buffer
 
             while (rxRunning.get()) {
                 val read = audioRecord.read(chunk, 0, chunk.size)
@@ -768,51 +798,56 @@ class MainActivity : ComponentActivity() {
 
                 var energy = 0.0
                 for (i in 0 until read) {
-                    val normSample = chunk[i] / 32768.0f
-                    rollingSamples.add(normSample)
-                    energy += normSample * normSample
+                    val s = chunk[i] / 32768.0f
+                    energy += s * s
                 }
                 energy /= read
 
-                while (rollingSamples.size > maxRolling) {
-                    rollingSamples.removeAt(0)
-                }
+                // Continuous non-blocking write to circular buffer
+                ringBuffer.write(chunk, read)
 
-                // If acoustic energy exceeds background threshold, test sync
-                if (energy > 0.0003 && rollingSamples.size >= sampleRate * 2) {
-                    val audioSnapshot = rollingSamples.toFloatArray()
+                // Check for acoustic burst when sufficient energy present
+                if (energy > 0.0001 && ringBuffer.size() >= sampleRate * 1) {
+                    val audioSnapshot = ringBuffer.snapshot()
                     val (bbRe, bbIm) = ModemPhy.toBaseband(audioSnapshot)
-                    val syncResult = ModemPhy.sync(bbRe, bbIm, ReefSpec.DEFAULT_SF, thr = 4.5)
+                    val syncResult = ModemPhy.sync(bbRe, bbIm, ReefSpec.DEFAULT_SF)
 
                     if (syncResult != null) {
-                        runOnUiThread {
-                            logOutput += "\n----------------------------------------"
-                            logOutput += "\n[RX SYNC] Preamble Locked!"
-                            logOutput += "\n  Start: ${syncResult.start} bb | CFO: %.2f bins | SNR: %.1f dB".format(
-                                syncResult.cfo, syncResult.snrDb
-                            )
+                        val neededBb = syncResult.start + 40 * 128
+                        // If the burst is still actively arriving over the air, DON'T sleep!
+                        // Simply continue the loop so AudioRecord reads incoming chunks!
+                        if (bbRe.size < neededBb) {
+                            continue
                         }
 
+                        // Full burst is now in buffer: demodulate!
                         val frame = ModemPhy.demodulateF0(bbRe, bbIm, syncResult, ReefSpec.DEFAULT_SF)
                         if (frame != null && frame.ok) {
                             val decodedCoral = BitChain.unpackL0(frame.payload)
                             runOnUiThread {
                                 currentRecord = decodedCoral
-                                lastStatus = "DECODED: Coral #${decodedCoral.coral} (Burst ${frame.burst})"
+                                val burstKind = if (frame.n == 1) "SHORT" else "LONG"
+                                lastStatus = "DECODED: Coral #${decodedCoral.coral} ($burstKind)"
+                                logOutput += "\n----------------------------------------"
                                 logOutput += "\n[RX CRC16: PASS] 140b Frame Decoded!"
-                                logOutput += "\n  Burst ID : ${frame.burst} | Layer: ${frame.layer}"
-                                logOutput += "\n  Coral ID : #${decodedCoral.coral}"
-                                logOutput += "\n  Bleach   : %.2f (Index)".format(decodedCoral.bleach)
-                                logOutput += "\n  Health   : Score H%d".format(decodedCoral.health)
-                                logOutput += "\n  Texture  : Level T%d / 15".format(decodedCoral.texture)
+                                logOutput += "\n  Burst Mode : $burstKind (${frame.n} frame${if (frame.n > 1) "s" else ""})"
+                                logOutput += "\n  Coral ID   : #${decodedCoral.coral}"
+                                logOutput += "\n  Bleach     : %.2f (Index)".format(decodedCoral.bleach)
+                                logOutput += "\n  Health     : Score H%d".format(decodedCoral.health)
+                                logOutput += "\n  Texture    : Level T%d / 15".format(decodedCoral.texture)
+                                logOutput += "\n  Signal SNR : %.1f dB | CFO: %.2f bins".format(syncResult.snrDb, syncResult.cfo)
                                 logOutput += "\n----------------------------------------"
                             }
-                            rollingSamples.clear()
-                            Thread.sleep(1500)
+                            ringBuffer.clear()
+                            Thread.sleep(800) // Brief pause to prevent echo re-trigger
                         } else if (frame != null && !frame.ok) {
                             runOnUiThread {
-                                logOutput += "\n[RX CRC16: FAIL] Frame CRC mismatch."
+                                logOutput += "\n[RX CRC16: FAIL] Frame CRC mismatch (SNR: %.1f dB, CFO: %.2f)".format(
+                                    syncResult.snrDb, syncResult.cfo
+                                )
                             }
+                            ringBuffer.clear()
+                            Thread.sleep(300)
                         }
                     }
                 }
@@ -837,7 +872,7 @@ class MainActivity : ComponentActivity() {
 }
 
 // ============================================================================
-// 5. JETPACK COMPOSE UI (SCROLLABLE LOG & JUSTIFIED LAYOUT)
+// 6. JETPACK COMPOSE UI (SCROLLABLE LOG & JUSTIFIED LAYOUT)
 // ============================================================================
 @Composable
 fun ReefGlyphMainScreen(
@@ -855,7 +890,6 @@ fun ReefGlyphMainScreen(
     val screenScrollState = rememberScrollState()
     val terminalScrollState = rememberScrollState()
 
-    // Auto-scroll terminal log to bottom on new message
     LaunchedEffect(log) {
         terminalScrollState.animateScrollTo(terminalScrollState.maxValue)
     }
@@ -867,7 +901,6 @@ fun ReefGlyphMainScreen(
             .padding(16.dp)
             .verticalScroll(screenScrollState)
     ) {
-        // App Header
         Text(
             text = "ReefGlyph Acoustic Modem",
             fontSize = 22.sp,
@@ -875,7 +908,7 @@ fun ReefGlyphMainScreen(
             color = Color(0xFF38BDF8)
         )
         Text(
-            text = "Spec v1.1 | 1-4 kHz CSS SF7 | 16B Aligned PHY",
+            text = "Spec v1.1 | 1-4 kHz CSS SF7 | Pure Continuous PHY",
             fontSize = 12.sp,
             color = Color(0xFF94A3B8)
         )
@@ -1013,12 +1046,10 @@ fun ReefGlyphMainScreen(
 
         Spacer(modifier = Modifier.height(12.dp))
 
-        // Status Header
         Text(text = "STATUS: $status", fontSize = 12.sp, color = Color(0xFFFBBF24), fontWeight = FontWeight.Bold)
 
         Spacer(modifier = Modifier.height(6.dp))
 
-        // Scrollable & Formatted Terminal Output
         Box(
             modifier = Modifier
                 .fillMaxWidth()
