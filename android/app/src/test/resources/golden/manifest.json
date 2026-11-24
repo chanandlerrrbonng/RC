@@ -1,0 +1,137 @@
+{
+  "cases": {
+    "short_clean": {
+      "filename": "short_clean.wav",
+      "kind": "short",
+      "expected_decoded_frames_hex": [
+        "005744a8d23c8b67a35875bb00000007ac60"
+      ],
+      "expected_snr4": 15
+    },
+    "long_clean": {
+      "filename": "long_clean.wav",
+      "kind": "long",
+      "expected_decoded_frames_hex": [
+        "025744a8d23c8b67a35875bb0000000e7d20",
+        "465710864298e84a96b635cf84653a51d890",
+        "4a572b6be33adf3bd5ce600000000000c350",
+        "8e571b1b1b1bb1b1b1b11b1b1b1bb1b73640",
+        "92571b1b11b1b1b1bb1b1b1b11b1b1be9c50",
+        "96571bb1b1b1b11b1b1b1bb1b1b1b1106270",
+        "9a57b1b1b1bb1b1b1b11b1b1b1bb1b1a6fa0",
+        "9e57b1b11b1b1b1bb1b1b1b11ae5c48721d0",
+        "a25792537de76000000000000000000ee940"
+      ],
+      "expected_snr4": 15
+    },
+    "long_noise": {
+      "filename": "long_noise.wav",
+      "kind": "long",
+      "expected_decoded_frames_hex": [
+        "025744a8d23c8b67a35875bb0000000e7d20",
+        "465710864298e84a96b635cf84653a51d890",
+        "4a572b6be33adf3bd5ce600000000000c350",
+        "8e571b1b1b1bb1b1b1b11b1b1b1bb1b73640",
+        "92571b1b11b1b1b1bb1b1b1b11b1b1be9c50",
+        "96571bb1b1b1b11b1b1b1bb1b1b1b1106270",
+        "9a57b1b1b1bb1b1b1b11b1b1b1bb1b1a6fa0",
+        "9e57b1b11b1b1b1bb1b1b1b11ae5c48721d0",
+        "a25792537de76000000000000000000ee940"
+      ],
+      "expected_snr4": 15
+    },
+    "long_delay": {
+      "filename": "long_delay.wav",
+      "kind": "long",
+      "expected_decoded_frames_hex": [
+        "025744a8d23c8b67a35875bb0000000e7d20",
+        "465710864298e84a96b635cf84653a51d890",
+        "4a572b6be33adf3bd5ce600000000000c350",
+        "8e571b1b1b1bb1b1b1b11b1b1b1bb1b73640",
+        "92571b1b11b1b1b1bb1b1b1b11b1b1be9c50",
+        "96571bb1b1b1b11b1b1b1bb1b1b1b1106270",
+        "9a57b1b1b1bb1b1b1b11b1b1b1bb1b1a6fa0",
+        "9e57b1b11b1b1b1bb1b1b1b11ae5c48721d0",
+        "a25792537de76000000000000000000ee940"
+      ],
+      "expected_snr4": 15
+    },
+    "long_multipath": {
+      "filename": "long_multipath.wav",
+      "kind": "long",
+      "expected_decoded_frames_hex": [
+        "025744a8d23c8b67a35875bb0000000e7d20",
+        "465710864298e84a96b635cf84653a51d890",
+        "4a572b6be33adf3bd5ce600000000000c350",
+        "8e571b1b1b1bb1b1b1b11b1b1b1bb1b73640",
+        "92571b1b11b1b1b1bb1b1b1b11b1b1be9c50",
+        "96571bb1b1b1b11b1b1b1bb1b1b1b1106270",
+        "9a57b1b1b1bb1b1b1b11b1b1b1bb1b1a6fa0",
+        "9e57b1b11b1b1b1bb1b1b1b11ae5c48721d0",
+        "a25792537de76000000000000000000ee940"
+      ],
+      "expected_snr4": 15
+    },
+    "long_cfo_plus100ppm": {
+      "filename": "long_cfo_plus100ppm.wav",
+      "kind": "long",
+      "expected_decoded_frames_hex": [
+        "025744a8d23c8b67a35875bb0000000e7d20",
+        "465710864298e84a96b635cf84653a51d890",
+        "4a572b6be33adf3bd5ce600000000000c350",
+        "8e571b1b1b1bb1b1b1b11b1b1b1bb1b73640",
+        "92571b1b11b1b1b1bb1b1b1b11b1b1be9c50",
+        "96571bb1b1b1b11b1b1b1bb1b1b1b1106270",
+        "9a57b1b1b1bb1b1b1b11b1b1b1bb1b1a6fa0",
+        "9e57b1b11b1b1b1bb1b1b1b11ae5c48721d0",
+        "a25792537de76000000000000000000ee940"
+      ],
+      "expected_snr4": 15
+    },
+    "long_cfo_minus100ppm": {
+      "filename": "long_cfo_minus100ppm.wav",
+      "kind": "long",
+      "expected_decoded_frames_hex": [
+        "025744a8d23c8b67a35875bb0000000e7d20",
+        "465710864298e84a96b635cf84653a51d890",
+        "4a572b6be33adf3bd5ce600000000000c350",
+        "8e571b1b1b1bb1b1b1b11b1b1b1bb1b73640",
+        "92571b1b11b1b1b1bb1b1b1b11b1b1be9c50",
+        "96571bb1b1b1b11b1b1b1bb1b1b1b1106270",
+        "9a57b1b1b1bb1b1b1b11b1b1b1bb1b1a6fa0",
+        "9e57b1b11b1b1b1bb1b1b1b11ae5c48721d0",
+        "a25792537de76000000000000000000ee940"
+      ],
+      "expected_snr4": 15
+    },
+    "long_clipped": {
+      "filename": "long_clipped.wav",
+      "kind": "long",
+      "expected_decoded_frames_hex": [
+        "025744a8d23c8b67a35875bb0000000e7d20",
+        "465710864298e84a96b635cf84653a51d890",
+        "4a572b6be33adf3bd5ce600000000000c350",
+        "8e571b1b1b1bb1b1b1b11b1b1b1bb1b73640",
+        "92571b1b11b1b1b1bb1b1b1b11b1b1be9c50",
+        "96571bb1b1b1b11b1b1b1bb1b1b1b1106270",
+        "9a57b1b1b1bb1b1b1b11b1b1b1bb1b1a6fa0",
+        "9e57b1b11b1b1b1bb1b1b1b11ae5c48721d0",
+        "a25792537de76000000000000000000ee940"
+      ],
+      "expected_snr4": 15
+    },
+    "ack_clean": {
+      "filename": "ack_clean.wav",
+      "kind": "ack",
+      "expected_decoded_frames_hex": [
+        "5fff2a80"
+      ],
+      "expected_snr4": 15
+    }
+  },
+  "sample_layers": {
+    "L0": "44a8d23c8b67a35875bb",
+    "L1": "10864298e84a96b635cf84653a52b6be33adf3bd5ce6",
+    "L2": "1b1b1b1bb1b1b1b11b1b1b1bb1b1b1b11b1b1b1bb1b1b1b11b1b1b1bb1b1b1b11b1b1b1bb1b1b1b11b1b1b1bb1b1b1b11b1b1b1bb1b1b1b11b1b1b1bb1b1b1b11ae5c4892537de76"
+  }
+}

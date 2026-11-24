@@ -9,6 +9,7 @@ import android.media.AudioTrack
 import android.media.MediaRecorder
 import android.os.Build
 import android.os.Bundle
+import android.os.SystemClock
 import android.view.KeyEvent
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -34,586 +35,46 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
-import org.jtransforms.fft.DoubleFFT_1D
 import org.reefglyph.ui.theme.ReefGlyphTheme
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
-import kotlin.math.*
+import kotlin.math.roundToInt
 
-// ============================================================================
-// 1. SPECIFICATION CONSTANTS & HELPERS (Spec v1.1 Frozen)
-// ============================================================================
-object ReefSpec {
-    const val FS_AUDIO = 48000
-    const val BW = 3000
-    const val FC = 2500.0
-    const val DEFAULT_SF = 7
-    const val OSR = FS_AUDIO / BW // 16 samples per baseband sample
-
-    const val N_UP = 8
-    const val N_DOWN = 2
-    const val PREAMBLE_SYMS = N_UP + N_DOWN // 10
-
-    const val HDR_BITS = 16
-    const val PAY_BITS = 108
-    const val CRC_BITS = 16
-    const val FRAME_BITS = HDR_BITS + PAY_BITS + CRC_BITS // 140
-
-    const val L0_BITS = 80 // includes 4-bit texture index
-    const val L1_BITS = 175
-    const val L2_BITS = 576
-    const val ACK_BITS = 28
-
-    fun frameSymbols(sf: Int = DEFAULT_SF, first: Boolean = false): Int {
-        val n = if (first) 8 else 7
-        return (-( -35 / sf )) * n // 40 for F0, 35 for F1..F8
-    }
-
-    fun bitsToInt(b: IntArray): Int {
-        var v = 0
-        for (x in b) v = (v shl 1) or (x and 1)
-        return v
-    }
-
-    fun intToBits(v: Int, n: Int): IntArray =
-        IntArray(n) { i -> (v shr (n - 1 - i)) and 1 }
-
-    fun quantize(v: Double, lo: Double, hi: Double, bits: Int): Int {
-        val maxVal = (1 shl bits) - 1
-        val scaled = (v - lo) / (hi - lo) * maxVal
-        return Math.rint(scaled).toInt().coerceIn(0, maxVal)
-    }
-
-    fun dequantize(q: Int, lo: Double, hi: Double, bits: Int): Double {
-        val maxVal = (1 shl bits) - 1
-        return lo + q.toDouble() / maxVal * (hi - lo)
-    }
-}
-
-// ============================================================================
-// 2. DATA MODELS & BIT CHAIN (FEC, CRC, WHITENING, GRAY)
-// ============================================================================
-data class CoralRecord(
-    var transect: Int = 1,
-    var coral: Int = 42,
-    var depthM: Double = 7.5,
-    var timeS: Double = 300.0,
-    var bleach: Double = 0.62,
-    var health: Int = 4,
-    var morph: Int = 0,
-    var colors: List<Triple<Double, Double, Double>> = listOf(
-        Triple(80.0, 5.0, 10.0),
-        Triple(60.0, -4.0, 12.0)
-    ),
-    var patch: Int = 0,
-    var evidence: Int = 1,
-    var texture: Int = 7
-)
-
-data class ModemFrame(
-    val layer: Int,
-    val idx: Int,
-    val n: Int,
-    val burst: Int,
-    val payload: IntArray,
-    var ok: Boolean = true
-)
-
-object BitChain {
-    fun whiten(bits: IntArray): IntArray {
-        var s = 0xFF
-        val out = IntArray(bits.size)
-        for (i in bits.indices) {
-            val bit = s and 1
-            val fb = ((s shr 7) xor (s shr 5) xor (s shr 4) xor (s shr 3)) and 1
-            s = ((s shl 1) or fb) and 0xFF
-            out[i] = bits[i] xor bit
-        }
-        return out
-    }
-
-    fun grayEnc(v: Int): Int = v xor (v shr 1)
-
-    fun grayDec(g: Int): Int {
-        var v = 0
-        var temp = g
-        while (temp > 0) {
-            v = v xor temp
-            temp = temp shr 1
-        }
-        return v
-    }
-
-    private fun hammingCodeword(nib: Int, n: Int): IntArray {
-        val d0 = (nib shr 3) and 1
-        val d1 = (nib shr 2) and 1
-        val d2 = (nib shr 1) and 1
-        val d3 = nib and 1
-        val p1 = d0 xor d1 xor d3
-        val p2 = d0 xor d2 xor d3
-        val p3 = d1 xor d2 xor d3
-        return if (n == 8) {
-            val sumP = (d0 + d1 + d2 + d3 + p1 + p2 + p3) and 1
-            intArrayOf(d0, d1, d2, d3, p1, p2, p3, sumP)
-        } else {
-            intArrayOf(d0, d1, d2, d3, p1, p2, p3)
-        }
-    }
-
-    val encTable = mapOf(
-        7 to Array(16) { hammingCodeword(it, 7) },
-        8 to Array(16) { hammingCodeword(it, 8) }
-    )
-
-    val decTable = mapOf(
-        7 to IntArray(128) { w ->
-            val wb = ReefSpec.intToBits(w, 7)
-            (0 until 16).minByOrNull { k ->
-                val cw = encTable[7]!![k]
-                (0 until 7).count { wb[it] != cw[it] }
-            } ?: 0
-        },
-        8 to IntArray(256) { w ->
-            val wb = ReefSpec.intToBits(w, 8)
-            (0 until 16).minByOrNull { k ->
-                val cw = encTable[8]!![k]
-                (0 until 8).count { wb[it] != cw[it] }
-            } ?: 0
-        }
-    )
-
-    fun encodeBits(bits: IntArray, sf: Int, n: Int): IntArray {
-        val w = whiten(bits)
-        val numNibs = w.size / 4
-        val cws = ArrayList<IntArray>()
-        for (i in 0 until numNibs) {
-            val nib = ReefSpec.bitsToInt(w.copyOfRange(i * 4, (i + 1) * 4))
-            cws.add(encTable[n]!![nib])
-        }
-        val pad = Math.floorMod(-cws.size, sf)
-        repeat(pad) { cws.add(IntArray(n)) }
-
-        val syms = ArrayList<Int>()
-        val numBlocks = cws.size / sf
-        for (b in 0 until numBlocks) {
-            val blk = cws.subList(b * sf, (b + 1) * sf)
-            for (j in 0 until n) {
-                val colBits = IntArray(sf) { row -> blk[row][j] }
-                syms.add(grayDec(ReefSpec.bitsToInt(colBits)))
-            }
-        }
-        return syms.toIntArray()
-    }
-
-    fun decodeSyms(syms: IntArray, sf: Int, n: Int, nbits: Int): IntArray {
-        val vals = syms.map { grayEnc(it) }
-        val cws = ArrayList<IntArray>()
-        for (k in 0 until vals.size step n) {
-            val blockCols = Array(n) { j -> ReefSpec.intToBits(vals[k + j], sf) }
-            for (row in 0 until sf) {
-                cws.add(IntArray(n) { col -> blockCols[col][row] })
-            }
-        }
-        val validCws = cws.take(nbits / 4)
-        val nibs = validCws.map { cw ->
-            val cwInt = ReefSpec.bitsToInt(cw)
-            decTable[n]!![cwInt]
-        }
-        val bits = ArrayList<Int>()
-        for (nib in nibs) {
-            for (b in ReefSpec.intToBits(nib, 4)) bits.add(b)
-        }
-        return whiten(bits.toIntArray())
-    }
-
-    fun crc16(bits: IntArray): Int {
-        var crc = 0xFFFF
-        for (b in bits) {
-            val top = ((crc shr 15) and 1) xor (b and 1)
-            crc = (crc shl 1) and 0xFFFF
-            if (top != 0) crc = crc xor 0x1021
-        }
-        return crc
-    }
-
-    fun packL0(r: CoralRecord): IntArray {
-        val b = ArrayList<Int>()
-        fun add(v: Int, n: Int) {
-            for (x in ReefSpec.intToBits(v, n)) b.add(x)
-        }
-        add(r.transect, 6)
-        add(r.coral, 8)
-        add(ReefSpec.quantize(r.depthM, 0.0, 63.5, 7), 7)
-        add(ReefSpec.quantize(r.timeS, 0.0, 5115.0, 10), 10)
-        add(ReefSpec.quantize(r.bleach, 0.0, 1.0, 6), 6)
-        add((r.health - 1).coerceIn(0, 5), 3)
-        add(r.morph.coerceIn(0, 3), 2)
-        for (c in r.colors.take(2)) {
-            val Lq = ReefSpec.quantize(c.first, 0.0, 100.0, 6)
-            val aq = Math.rint(c.second / 4.0).toInt() + 16
-            val bq = Math.rint(c.third / 4.0).toInt() + 16
-            add(Lq, 6)
-            add(aq.coerceIn(0, 31), 5)
-            add(bq.coerceIn(0, 31), 5)
-        }
-        add(r.patch, 1)
-        add(r.evidence, 1)
-        add(r.texture.coerceIn(0, 15), 4)
-        val res = b.toIntArray()
-        check(res.size == 80) { "L0 bits count must be 80" }
-        return res
-    }
-
-    fun unpackL0(bits: IntArray): CoralRecord {
-        var p = 0
-        fun rd(n: Int): Int {
-            val v = ReefSpec.bitsToInt(bits.copyOfRange(p, p + n))
-            p += n
-            return v
-        }
-        val r = CoralRecord()
-        r.transect = rd(6)
-        r.coral = rd(8)
-        r.depthM = ReefSpec.dequantize(rd(7), 0.0, 63.5, 7)
-        r.timeS = ReefSpec.dequantize(rd(10), 0.0, 5115.0, 10)
-        r.bleach = ReefSpec.dequantize(rd(6), 0.0, 1.0, 6)
-        r.health = rd(3) + 1
-        r.morph = rd(2)
-        val cols = mutableListOf<Triple<Double, Double, Double>>()
-        repeat(2) {
-            val l = ReefSpec.dequantize(rd(6), 0.0, 100.0, 6)
-            val a = (rd(5) - 16) * 4.0
-            val bVal = (rd(5) - 16) * 4.0
-            cols.add(Triple(l, a, bVal))
-        }
-        r.colors = cols
-        r.patch = rd(1)
-        r.evidence = rd(1)
-        r.texture = rd(4)
-        return r
-    }
-
-    fun packFrame(f: ModemFrame): IntArray {
-        val b = ArrayList<Int>()
-        fun add(v: Int, n: Int) {
-            for (x in ReefSpec.intToBits(v, n)) b.add(x)
-        }
-        add(f.layer, 2)
-        add(f.idx, 4)
-        add(f.n, 4)
-        add(f.burst, 6)
-        val pay = IntArray(ReefSpec.PAY_BITS)
-        System.arraycopy(f.payload, 0, pay, 0, min(f.payload.size, ReefSpec.PAY_BITS))
-        for (x in pay) b.add(x)
-
-        val body = b.toIntArray()
-        val crc = crc16(body)
-        val crcBits = ReefSpec.intToBits(crc, 16)
-        val out = IntArray(140)
-        System.arraycopy(body, 0, out, 0, 124)
-        System.arraycopy(crcBits, 0, out, 124, 16)
-        return out
-    }
-
-    fun unpackFrame(bits: IntArray): ModemFrame {
-        if (bits.size < 140) return ModemFrame(0, 0, 0, 0, IntArray(0), false)
-        val body = bits.copyOfRange(0, 124)
-        val crcReceived = ReefSpec.bitsToInt(bits.copyOfRange(124, 140))
-        val crcCalculated = crc16(body)
-        val ok = (crcReceived == crcCalculated)
-
-        val layer = ReefSpec.bitsToInt(bits.copyOfRange(0, 2))
-        val idx = ReefSpec.bitsToInt(bits.copyOfRange(2, 6))
-        val n = ReefSpec.bitsToInt(bits.copyOfRange(6, 10))
-        val burst = ReefSpec.bitsToInt(bits.copyOfRange(10, 16))
-        val payload = bits.copyOfRange(16, 124)
-        return ModemFrame(layer, idx, n, burst, payload, ok)
-    }
-}
-
-// ============================================================================
-// 3. ZERO-ALLOCATION AUDIO RING BUFFER (Thread-safe, 6-second circular memory)
-// ============================================================================
 class AudioRingBuffer(val capacity: Int) {
-    private val buf = FloatArray(capacity)
-    private var writePos = 0
-    private var totalCount = 0
+    private val samples = FloatArray(capacity)
+    private var writePosition = 0
+    private var sampleCount = 0
 
     @Synchronized
-    fun write(data: ShortArray, len: Int) {
-        for (i in 0 until len) {
-            buf[writePos] = data[i] / 32768.0f
-            writePos = (writePos + 1) % capacity
-            if (totalCount < capacity) totalCount++
+    fun write(data: FloatArray) {
+        for (sample in data) {
+            samples[writePosition] = sample
+            writePosition = (writePosition + 1) % capacity
+            if (sampleCount < capacity) sampleCount++
         }
     }
 
     @Synchronized
     fun snapshot(): FloatArray {
-        val out = FloatArray(totalCount)
-        val start = (writePos - totalCount + capacity) % capacity
-        for (i in 0 until totalCount) {
-            out[i] = buf[(start + i) % capacity]
-        }
-        return out
+        val result = FloatArray(sampleCount)
+        val start = (writePosition - sampleCount + capacity) % capacity
+        for (i in 0 until sampleCount) result[i] = samples[(start + i) % capacity]
+        return result
     }
 
     @Synchronized
-    fun size(): Int = totalCount
+    fun size(): Int = sampleCount
 
     @Synchronized
     fun clear() {
-        writePos = 0
-        totalCount = 0
+        writePosition = 0
+        sampleCount = 0
     }
 }
 
-// ============================================================================
-// 4. PHY MODULATION & DEMODULATION ENGINE
-// ============================================================================
-data class SyncResult(
-    val start: Int,
-    val cfo: Double,
-    val tau: Double,
-    val snrDb: Double
-)
-
-object ModemPhy {
-    private val fft128 = DoubleFFT_1D(128L)
-
-    fun baseChirp(sf: Int): Array<DoubleArray> {
-        val nSamples = 1 shl sf
-        val out = Array(nSamples) { DoubleArray(2) }
-        for (n in 0 until nSamples) {
-            val phase = PI * n * n / nSamples - PI * n
-            out[n][0] = cos(phase)
-            out[n][1] = sin(phase)
-        }
-        return out
-    }
-
-    fun symWave(k: Int, sf: Int, down: Boolean = false): Array<DoubleArray> {
-        val base = baseChirp(sf)
-        val nSamples = 1 shl sf
-        val out = Array(nSamples) { DoubleArray(2) }
-        for (n in 0 until nSamples) {
-            val idx = Math.floorMod(n + k, nSamples)
-            val re = base[idx][0]
-            val im = base[idx][1]
-            out[n][0] = re
-            out[n][1] = if (down) -im else im
-        }
-        return out
-    }
-
-    fun modulate(frames: List<IntArray>, sf: Int = ReefSpec.DEFAULT_SF): FloatArray {
-        val parts = ArrayList<Array<DoubleArray>>()
-        repeat(ReefSpec.N_UP) { parts.add(symWave(0, sf, false)) }
-        repeat(ReefSpec.N_DOWN) { parts.add(symWave(0, sf, true)) }
-
-        for ((idx, frameBits) in frames.withIndex()) {
-            val nFec = if (idx == 0) 8 else 7
-            val syms = BitChain.encodeBits(frameBits, sf, nFec)
-            for (s in syms) parts.add(symWave(s, sf, false))
-        }
-
-        val nSamples = 1 shl sf
-        parts.add(Array(nSamples * 2) { DoubleArray(2) })
-
-        val totalBaseband = parts.sumOf { it.size }
-        val bbRe = DoubleArray(totalBaseband)
-        val bbIm = DoubleArray(totalBaseband)
-        var offset = 0
-        for (p in parts) {
-            for (sample in p) {
-                bbRe[offset] = sample[0]
-                bbIm[offset] = sample[1]
-                offset++
-            }
-        }
-
-        val totalAudio = totalBaseband * ReefSpec.OSR
-        val audio = FloatArray(totalAudio)
-        var maxAbs = 1e-12
-
-        for (i in 0 until totalAudio) {
-            val t = i.toDouble() / ReefSpec.FS_AUDIO
-            val bbIdx = (i / ReefSpec.OSR).coerceIn(0, totalBaseband - 1)
-            val carrierPhase = 2.0 * PI * ReefSpec.FC * t
-            val sampleVal = bbRe[bbIdx] * cos(carrierPhase) - bbIm[bbIdx] * sin(carrierPhase)
-            audio[i] = sampleVal.toFloat()
-            val absVal = abs(sampleVal)
-            if (absVal > maxAbs) maxAbs = absVal
-        }
-
-        val scale = (0.8 / maxAbs).toFloat()
-        for (i in audio.indices) audio[i] *= scale
-        return audio
-    }
-
-    // Precise phase-preserving baseband downconversion (OSR = 16 integrate-and-dump decimation)
-    fun toBaseband(audio: FloatArray): Pair<DoubleArray, DoubleArray> {
-        val nOut = audio.size / ReefSpec.OSR
-        val bbRe = DoubleArray(nOut)
-        val bbIm = DoubleArray(nOut)
-
-        for (k in 0 until nOut) {
-            var sumRe = 0.0
-            var sumIm = 0.0
-            for (m in 0 until ReefSpec.OSR) {
-                val idx = k * ReefSpec.OSR + m
-                val t = idx.toDouble() / ReefSpec.FS_AUDIO
-                val carrier = -2.0 * PI * ReefSpec.FC * t
-                val a = audio[idx] * 2.0
-                sumRe += a * cos(carrier)
-                sumIm += a * sin(carrier)
-            }
-            bbRe[k] = sumRe / ReefSpec.OSR
-            bbIm[k] = sumIm / ReefSpec.OSR
-        }
-        return Pair(bbRe, bbIm)
-    }
-
-    fun dechirpPeak(
-        bbRe: DoubleArray, bbIm: DoubleArray, start: Int,
-        ref: Array<DoubleArray>, sf: Int
-    ): Pair<Double, Double> {
-        val N = 1 shl sf
-        val fftBuf = DoubleArray(2 * N)
-        for (n in 0 until N) {
-            val sRe = bbRe[start + n]
-            val sIm = bbIm[start + n]
-            val rRe = ref[n][0]
-            val rIm = ref[n][1]
-            fftBuf[2 * n] = sRe * rRe - sIm * rIm
-            fftBuf[2 * n + 1] = sRe * rIm + sIm * rRe
-        }
-        fft128.complexForward(fftBuf)
-
-        val mag = DoubleArray(N) { i ->
-            hypot(fftBuf[2 * i], fftBuf[2 * i + 1])
-        }
-
-        var p = 0
-        var maxM = mag[0]
-        for (i in 1 until N) {
-            if (mag[i] > maxM) {
-                maxM = mag[i]
-                p = i
-            }
-        }
-
-        val sorted = mag.clone().sortedArray()
-        val median = sorted[N / 2] + 1e-12
-        val ratio = maxM / median
-
-        val l = mag[Math.floorMod(p - 1, N)]
-        val r = mag[Math.floorMod(p + 1, N)]
-        val den = l - 2.0 * maxM + r
-        val d = if (den != 0.0) 0.5 * (l - r) / den else 0.0
-        return Pair(p.toDouble() + d, ratio)
-    }
-
-    private fun sw(v: Double, n: Double): Double =
-        ((v + n / 2.0).mod(n) + n).mod(n) - n / 2.0
-
-    // Robust sliding-dechirp sync tuned for distance and multipath
-    fun sync(bbRe: DoubleArray, bbIm: DoubleArray, sf: Int = ReefSpec.DEFAULT_SF): SyncResult? {
-        val N = 1 shl sf
-        val up = baseChirp(sf)
-        val cu = Array(N) { i -> doubleArrayOf(up[i][0], -up[i][1]) }
-        val cd = up
-
-        val nw = bbRe.size / N
-        if (nw < 16) return null
-
-        val pks = ArrayList<Pair<Double, Double>>()
-        for (g in 0 until nw) {
-            pks.add(dechirpPeak(bbRe, bbIm, g * N, cu, sf))
-        }
-
-        // Lock condition: 4 consecutive up-chirp peaks with aligned bins
-        var g0: Int? = null
-        for (g in 0 until (nw - 4)) {
-            val w = (0 until 4).map { pks[g + it] }
-            val avgRatio = w.map { it.second }.average()
-            if (avgRatio > 3.2 && w.all { it.second > 2.0 } &&
-                w.all { abs(sw(it.first - w[0].first, N.toDouble())) < 3.0 }) {
-                g0 = g
-                break
-            }
-        }
-        if (g0 == null) return null
-
-        var a = Math.rint(g0 * N - sw(pks[g0].first, N.toDouble())).toInt()
-        while (a < 0) a += N
-
-        // Search for down-chirp marker (iD)
-        var iD: Int? = null
-        for (i in 0 until 16) {
-            val s = a + i * N
-            if (s + N > bbRe.size) return null
-            val ru = dechirpPeak(bbRe, bbIm, s, cu, sf).second
-            val rd = dechirpPeak(bbRe, bbIm, s, cd, sf).second
-            if (rd > ru && rd > 2.2) {
-                iD = i
-                break
-            }
-        }
-        if (iD == null || iD < 1) return null
-
-        val bu = sw(dechirpPeak(bbRe, bbIm, a + (iD - 1) * N, cu, sf).first, N.toDouble())
-        val bd = sw(dechirpPeak(bbRe, bbIm, a + iD * N, cd, sf).first, N.toDouble())
-        val cfo = sw((bu + bd) / 2.0, (N / 2).toDouble())
-        val tau = (bu - bd) / 2.0
-        val start = a + (iD + 2) * N - Math.rint(tau).toInt()
-
-        val ups = (max(0, iD - 6) until iD).map { k ->
-            dechirpPeak(bbRe, bbIm, a + k * N, cu, sf).second
-        }
-        val meanUp = if (ups.isNotEmpty()) ups.average() else 1.0
-        val snrDb = 20.0 * log10(max(1.0, meanUp))
-
-        return SyncResult(start, cfo, tau, snrDb)
-    }
-
-    fun demodulateF0(
-        bbRe: DoubleArray, bbIm: DoubleArray,
-        syncResult: SyncResult, sf: Int = ReefSpec.DEFAULT_SF
-    ): ModemFrame? {
-        val N = 1 shl sf
-        val up = baseChirp(sf)
-        val cu = Array(N) { i -> doubleArrayOf(up[i][0], -up[i][1]) }
-        val nSyms = ReefSpec.frameSymbols(sf, true) // 40 symbols
-
-        val derotRe = DoubleArray(bbRe.size)
-        val derotIm = DoubleArray(bbIm.size)
-        for (n in bbRe.indices) {
-            val phase = -2.0 * PI * syncResult.cfo * n / N
-            val c = cos(phase)
-            val s = sin(phase)
-            derotRe[n] = bbRe[n] * c - bbIm[n] * s
-            derotIm[n] = bbRe[n] * s + bbIm[n] * c
-        }
-
-        val bins = IntArray(nSyms)
-        for (j in 0 until nSyms) {
-            val sPos = syncResult.start + j * N
-            if (sPos + N > derotRe.size) return null
-            val (peakBin, _) = dechirpPeak(derotRe, derotIm, sPos, cu, sf)
-            bins[j] = Math.floorMod(Math.rint(peakBin).toInt(), N)
-        }
-
-        val decodedBits = BitChain.decodeSyms(bins, sf, 8, ReefSpec.FRAME_BITS)
-        return BitChain.unpackFrame(decodedBits)
-    }
-}
-
-// ============================================================================
-// 5. MAIN ACTIVITY & CONTROLLER
-// ============================================================================
 class MainActivity : ComponentActivity() {
-
     private var isTransmitting by mutableStateOf(false)
     private var isListening by mutableStateOf(false)
     private var lastStatus by mutableStateOf("Ready (Idle)")
@@ -621,7 +82,23 @@ class MainActivity : ComponentActivity() {
     private var logOutput by mutableStateOf("Ready. Press TX to send, or START LISTENING.")
 
     private val rxRunning = AtomicBoolean(false)
+    private val rxCalibrated = AtomicBoolean(false)
+    private val txActive = AtomicBoolean(false)
+    private val ackWindow = AtomicBoolean(false)
+    private val sendInProgress = AtomicBoolean(false)
+    private val activeBurstId = AtomicInteger(-1)
+    private val receivedAck = AtomicReference<ModemCore.Ack?>(null)
+    private val burstCounter = AtomicInteger(0)
     private var rxThread: Thread? = null
+
+    private var gatedListen = true
+
+    private val sampleLayers by lazy {
+        mapOf(
+            1 to hexToBits("10864298e84a96b635cf84653a52b6be33adf3bd5ce6", 175),
+            2 to hexToBits("1b1b1b1bb1b1b1b11b1b1b1bb1b1b1b11b1b1b1bb1b1b1b11b1b1b1bb1b1b1b11b1b1b1bb1b1b1b11b1b1b1bb1b1b1b11b1b1b1bb1b1b1b11b1b1b1bb1b1b1b11b1b1b1bb1b1b1b11ae5c4892537de76", 576)
+        )
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -637,8 +114,8 @@ class MainActivity : ComponentActivity() {
                         isListening = isListening,
                         status = lastStatus,
                         log = logOutput,
-                        onSendShort = { sendBurst("short") },
-                        onSendLong = { sendBurst("long") },
+                        onSendShort = { sendBurst(short = true) },
+                        onSendLong = { sendBurst(short = false) },
                         onToggleListening = { toggleListening() },
                         onRecordChange = { currentRecord = it },
                         modifier = Modifier.padding(innerPadding)
@@ -650,8 +127,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
         if (keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) {
-            logOutput += "\n[Hardware] Volume-Down pressed! Sending SHORT burst..."
-            sendBurst("short")
+            appendLog("[Hardware] Volume-Down pressed! Sending SHORT burst...")
+            sendBurst(short = true)
             return true
         }
         return super.onKeyDown(keyCode, event)
@@ -670,105 +147,114 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun sendBurst(burstType: String) {
-        if (isTransmitting) return
-        thread {
-            isTransmitting = true
-            lastStatus = "Transmitting ${burstType.uppercase()} burst..."
-            try {
-                val l0Bits = BitChain.packL0(currentRecord)
-                val f0 = ModemFrame(0, 0, if (burstType == "short") 1 else 9, 42, l0Bits)
-                val frames = mutableListOf(BitChain.packFrame(f0))
-
-                if (burstType == "long") {
-                    for (i in 1..8) {
-                        val dummyPay = IntArray(ReefSpec.PAY_BITS) { 0 }
-                        frames.add(BitChain.packFrame(ModemFrame(if (i <= 2) 1 else 2, i, 9, 42, dummyPay)))
-                    }
-                }
-
-                val audio = ModemPhy.modulate(frames, ReefSpec.DEFAULT_SF)
-                val durationS = audio.size.toDouble() / ReefSpec.FS_AUDIO
-                logOutput += "\n[TX] Audio: ${audio.size} samples (%.2f s) at 48kHz".format(durationS)
-
-                val shortAudio = ShortArray(audio.size) { i ->
-                    (audio[i] * 32767).toInt().coerceIn(-32768, 32767).toShort()
-                }
-
-                val bufferSize = AudioTrack.getMinBufferSize(
-                    ReefSpec.FS_AUDIO,
-                    AudioFormat.CHANNEL_OUT_MONO,
-                    AudioFormat.ENCODING_PCM_16BIT
-                )
-
-                val track = AudioTrack.Builder()
-                    .setAudioAttributes(
-                        AudioAttributes.Builder()
-                            .setUsage(AudioAttributes.USAGE_MEDIA)
-                            .setContentType(AudioAttributes.CONTENT_TYPE_UNKNOWN)
-                            .build()
-                    )
-                    .setAudioFormat(
-                        AudioFormat.Builder()
-                            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                            .setSampleRate(ReefSpec.FS_AUDIO)
-                            .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-                            .build()
-                    )
-                    .setBufferSizeInBytes(max(bufferSize, shortAudio.size * 2))
-                    .setTransferMode(AudioTrack.MODE_STATIC)
-                    .build()
-
-                track.write(shortAudio, 0, shortAudio.size)
-                track.play()
-                logOutput += "\n[TX] Acoustic waveform playing..."
-                Thread.sleep((durationS * 1000).toLong() + 300)
-                track.stop()
-                track.release()
-
-                lastStatus = "Transmission complete."
-                logOutput += "\n[TX] Done! 3.0s ACK window opened."
-            } catch (e: Exception) {
-                lastStatus = "TX Error: ${e.message}"
-                logOutput += "\n[TX Error] ${e.localizedMessage}"
-            } finally {
-                isTransmitting = false
-            }
+    private fun sendBurst(short: Boolean) {
+        if (!sendInProgress.compareAndSet(false, true)) return
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissionsIfNeeded()
+            appendLog("[TX] Audio permission is required for ACK reception.")
+            sendInProgress.set(false)
+            return
         }
-    }
 
-    private fun toggleListening() {
-        if (isListening) {
-            rxRunning.set(false)
-            rxThread?.interrupt()
-            rxThread = null
-            isListening = false
-            lastStatus = "Receiver stopped."
-            logOutput += "\n[RX] Listener stopped."
+        val burstId = burstCounter.getAndUpdate { (it + 1) and 0x3F }
+        val liveL0 = packLiveL0(currentRecord.copy())
+        val layers = if (short) {
+            mapOf(0 to liveL0)
         } else {
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-                requestPermissionsIfNeeded()
-                return
-            }
-            isListening = true
-            rxRunning.set(true)
-            lastStatus = "Listening (48kHz Unprocessed)..."
-            logOutput += "\n[RX] Listening active. Waiting for acoustic chirp..."
+            sampleLayers + (0 to liveL0)
+        }
+        val originalFrames = ModemCore.packetize(layers, burstId)
+        isTransmitting = true
+        lastStatus = "Preparing ${if (short) "SHORT" else "LONG"} burst..."
 
-            rxThread = thread(name = "AcousticRxThread") {
-                runReceiverLoop()
+        thread(name = "AcousticTxThread") {
+            try {
+                var framesToSend = originalFrames
+                var complete = false
+                for (attempt in 1..ModemCore.MAX_ATTEMPTS) {
+                    activeBurstId.set(burstId)
+                    receivedAck.set(null)
+                    ackWindow.set(false)
+                    txActive.set(true)
+                    updateStatus("Transmitting ${if (short) "SHORT" else "LONG"} burst (attempt $attempt/${ModemCore.MAX_ATTEMPTS})...")
+                    appendLog("[TX] Burst $burstId: attempt $attempt, ${framesToSend.size} frame(s).")
+                    val audio = ModemCore.modulate(framesToSend)
+                    appendLog("[TX] Audio: ${audio.size} samples (%.2f s) at 48kHz".format(audio.size.toDouble() / ModemCore.SAMPLE_RATE))
+                    playAudio(audio)
+
+                    val modemTailMs = (2L * (1 shl ModemCore.DEFAULT_SF) * 1000L) / ModemCore.BANDWIDTH
+                    Thread.sleep((300L - modemTailMs).coerceAtLeast(0L))
+                    txActive.set(false)
+                    appendLog("[TX] ACK listen window opened for 3.0s.")
+
+                    val mainReceiverAvailable = rxRunning.get()
+                    ackWindow.set(mainReceiverAvailable)
+                    val ack = if (mainReceiverAvailable) {
+                        awaitMainReceiverAck(originalFrames)
+                    } else {
+                        listenForAck(burstId, ACK_WINDOW_MS)
+                    }
+                    ackWindow.set(false)
+                    if (ack == null || !ack.ok || ack.burstId != burstId) {
+                        appendLog("[ARQ] No valid ACK for burst $burstId; stopping after attempt $attempt.")
+                        break
+                    }
+
+                    val missing = originalFrames.indices.filter { !ack.bitmap[it] }
+                    if (missing.isEmpty()) {
+                        complete = true
+                        appendLog("[ARQ] Burst $burstId acknowledged; all ${originalFrames.size} frame(s) received.")
+                        break
+                    }
+                    if (attempt == ModemCore.MAX_ATTEMPTS) {
+                        appendLog("[ARQ] Burst $burstId still missing frame(s) $missing after $attempt attempts.")
+                        break
+                    }
+
+                    appendLog("[ARQ] Missing frame(s) $missing; selectively resending with burst ID $burstId.")
+                    framesToSend = ModemCore.buildSelectiveResendBurst(originalFrames, ack.bitmap, attempt)
+                    Thread.sleep(100)
+                }
+                updateStatus(if (complete) "Transmission acknowledged." else "Transmission finished; ACK incomplete or timed out.")
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                updateStatus("Transmission interrupted.")
+                appendLog("[TX] Transmission interrupted.")
+            } catch (e: Exception) {
+                updateStatus("TX Error: ${e.message}")
+                appendLog("[TX Error] ${e.localizedMessage}")
+            } finally {
+                txActive.set(false)
+                ackWindow.set(false)
+                activeBurstId.set(-1)
+                sendInProgress.set(false)
+                runOnUiThread { isTransmitting = false }
             }
         }
     }
 
-    private fun runReceiverLoop() {
-        val sampleRate = ReefSpec.FS_AUDIO
-        val minBufSize = AudioRecord.getMinBufferSize(
+    private fun awaitMainReceiverAck(originalFrames: List<IntArray>): ModemCore.Ack? {
+        val deadline = SystemClock.elapsedRealtime() + ACK_WINDOW_MS
+        while (SystemClock.elapsedRealtime() < deadline && rxRunning.get()) {
+            val ack = receivedAck.get()
+            if (ack != null && originalFrames.indices.all { it < ack.bitmap.size && ack.bitmap[it] }) break
+            Thread.sleep(25)
+        }
+        val ack = receivedAck.get()
+        if (ack != null && originalFrames.indices.any { it >= ack.bitmap.size || !ack.bitmap[it] }) {
+            while (SystemClock.elapsedRealtime() < deadline && rxRunning.get()) Thread.sleep(25)
+        }
+        return receivedAck.get()
+    }
+
+    private fun listenForAck(burstId: Int, durationMs: Long): ModemCore.Ack? {
+        val sampleRate = ModemCore.SAMPLE_RATE
+        val minBufferSize = AudioRecord.getMinBufferSize(
             sampleRate,
             AudioFormat.CHANNEL_IN_MONO,
             AudioFormat.ENCODING_PCM_16BIT
         )
-        val bufferSize = max(minBufSize, sampleRate * 2)
+        val bufferSize = maxOf(minBufferSize, sampleRate * 2)
         val audioRecord = try {
             AudioRecord(
                 MediaRecorder.AudioSource.UNPROCESSED,
@@ -777,7 +263,7 @@ class MainActivity : ComponentActivity() {
                 AudioFormat.ENCODING_PCM_16BIT,
                 bufferSize
             )
-        } catch (e: Exception) {
+        } catch (_: IllegalArgumentException) {
             AudioRecord(
                 MediaRecorder.AudioSource.VOICE_RECOGNITION,
                 sampleRate,
@@ -788,90 +274,369 @@ class MainActivity : ComponentActivity() {
         }
 
         try {
+            check(audioRecord.state == AudioRecord.STATE_INITIALIZED) { "Could not initialize ACK microphone capture" }
             audioRecord.startRecording()
-            val chunk = ShortArray(4800) // 100 ms chunks
-            val ringBuffer = AudioRingBuffer(sampleRate * 6) // 6s circular buffer
-
-            while (rxRunning.get()) {
+            val chunk = ShortArray(4800)
+            val ringBuffer = AudioRingBuffer(sampleRate * RX_RING_SECONDS)
+            val deadline = SystemClock.elapsedRealtime() + durationMs
+            var decodedAck: ModemCore.Ack? = null
+            while (SystemClock.elapsedRealtime() < deadline && !rxRunning.get()) {
                 val read = audioRecord.read(chunk, 0, chunk.size)
-                if (read <= 0) continue
-
-                var energy = 0.0
-                for (i in 0 until read) {
-                    val s = chunk[i] / 32768.0f
-                    energy += s * s
-                }
-                energy /= read
-
-                // Continuous non-blocking write to circular buffer
-                ringBuffer.write(chunk, read)
-
-                // Check for acoustic burst when sufficient energy present
-                if (energy > 0.0001 && ringBuffer.size() >= sampleRate * 1) {
-                    val audioSnapshot = ringBuffer.snapshot()
-                    val (bbRe, bbIm) = ModemPhy.toBaseband(audioSnapshot)
-                    val syncResult = ModemPhy.sync(bbRe, bbIm, ReefSpec.DEFAULT_SF)
-
-                    if (syncResult != null) {
-                        val neededBb = syncResult.start + 40 * 128
-                        // If the burst is still actively arriving over the air, DON'T sleep!
-                        // Simply continue the loop so AudioRecord reads incoming chunks!
-                        if (bbRe.size < neededBb) {
-                            continue
-                        }
-
-                        // Full burst is now in buffer: demodulate!
-                        val frame = ModemPhy.demodulateF0(bbRe, bbIm, syncResult, ReefSpec.DEFAULT_SF)
-                        if (frame != null && frame.ok) {
-                            val decodedCoral = BitChain.unpackL0(frame.payload)
-                            runOnUiThread {
-                                currentRecord = decodedCoral
-                                val burstKind = if (frame.n == 1) "SHORT" else "LONG"
-                                lastStatus = "DECODED: Coral #${decodedCoral.coral} ($burstKind)"
-                                logOutput += "\n----------------------------------------"
-                                logOutput += "\n[RX CRC16: PASS] 140b Frame Decoded!"
-                                logOutput += "\n  Burst Mode : $burstKind (${frame.n} frame${if (frame.n > 1) "s" else ""})"
-                                logOutput += "\n  Coral ID   : #${decodedCoral.coral}"
-                                logOutput += "\n  Bleach     : %.2f (Index)".format(decodedCoral.bleach)
-                                logOutput += "\n  Health     : Score H%d".format(decodedCoral.health)
-                                logOutput += "\n  Texture    : Level T%d / 15".format(decodedCoral.texture)
-                                logOutput += "\n  Signal SNR : %.1f dB | CFO: %.2f bins".format(syncResult.snrDb, syncResult.cfo)
-                                logOutput += "\n----------------------------------------"
-                            }
-                            ringBuffer.clear()
-                            Thread.sleep(800) // Brief pause to prevent echo re-trigger
-                        } else if (frame != null && !frame.ok) {
-                            runOnUiThread {
-                                logOutput += "\n[RX CRC16: FAIL] Frame CRC mismatch (SNR: %.1f dB, CFO: %.2f)".format(
-                                    syncResult.snrDb, syncResult.cfo
-                                )
-                            }
-                            ringBuffer.clear()
-                            Thread.sleep(300)
+                check(read > 0) { "Microphone capture failed during the ACK listen window" }
+                ringBuffer.write(FloatArray(read) { chunk[it] / 32768.0f })
+                if (decodedAck == null && ringBuffer.size() >= sampleRate) {
+                    val (ackBits, _) = ModemCore.demodulateAck(ringBuffer.snapshot())
+                    if (ackBits != null) {
+                        val ack = ModemCore.unpackAck(ackBits)
+                        if (ack.ok && ack.burstId == burstId) {
+                            decodedAck = ack
+                            appendLog("[RX] ACK for burst ${ack.burstId} decoded (SNR4=${ack.snr4}).")
                         }
                     }
                 }
             }
+            return decodedAck
+        } finally {
+            try {
+                if (audioRecord.recordingState == AudioRecord.RECORDSTATE_RECORDING) audioRecord.stop()
+            } finally {
+                audioRecord.release()
+            }
+        }
+    }
+
+    private fun toggleListening() {
+        if (rxRunning.get()) {
+            rxRunning.set(false)
+            rxCalibrated.set(false)
+            rxThread?.interrupt()
+            rxThread = null
+            isListening = false
+            lastStatus = "Receiver stopped."
+            appendLog("[RX] Listener stopped.")
+        } else {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                requestPermissionsIfNeeded()
+                return
+            }
+            startListening()
+        }
+    }
+
+    private fun startListening() {
+        rxCalibrated.set(false)
+        rxRunning.set(true)
+        isListening = true
+        lastStatus = "Listening (48kHz Unprocessed)..."
+        appendLog("[RX] Listening active. Calibrating noise floor for 1s...")
+        rxThread = thread(name = "AcousticRxThread") { runReceiverLoop() }
+    }
+
+    private fun runReceiverLoop() {
+        val sampleRate = ModemCore.SAMPLE_RATE
+        val minBufferSize = AudioRecord.getMinBufferSize(
+            sampleRate,
+            AudioFormat.CHANNEL_IN_MONO,
+            AudioFormat.ENCODING_PCM_16BIT
+        )
+        val bufferSize = maxOf(minBufferSize, sampleRate * 2)
+        val audioRecord = try {
+            AudioRecord(
+                MediaRecorder.AudioSource.UNPROCESSED,
+                sampleRate,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT,
+                bufferSize
+            )
+        } catch (_: IllegalArgumentException) {
+            AudioRecord(
+                MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                sampleRate,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT,
+                bufferSize
+            )
+        }
+
+        try {
+            check(audioRecord.state == AudioRecord.STATE_INITIALIZED) { "Could not initialize microphone capture" }
+            audioRecord.startRecording()
+            val chunk = ShortArray(4800)
+            val ringBuffer = AudioRingBuffer(sampleRate * RX_RING_SECONDS)
+            val reassembler = ModemCore.Reassembler()
+            var noiseFloor: ModemCore.RunningNoiseFloor? = null
+            var calibrationPower = 0.0
+            var calibrationChunks = 0
+            var calibrationSamples = 0
+            var previousGateSamples = FloatArray(0)
+            var candidate = false
+            var lastSignalAt = 0L
+            var lastUngatedSearchAt = 0L
+
+            while (rxRunning.get()) {
+                val read = audioRecord.read(chunk, 0, chunk.size)
+                if (read <= 0) continue
+                if (txActive.get()) {
+                    ringBuffer.clear()
+                    candidate = false
+                    previousGateSamples = FloatArray(0)
+                    continue
+                }
+
+                val audioChunk = FloatArray(read) { chunk[it] / 32768.0f }
+                ringBuffer.write(audioChunk)
+
+                if (ackWindow.get()) {
+                    if (receivedAck.get() == null && ringBuffer.size() >= sampleRate) {
+                        val (ackBits, _) = ModemCore.demodulateAck(ringBuffer.snapshot())
+                        if (ackBits != null) {
+                            val ack = ModemCore.unpackAck(ackBits)
+                            if (ack.ok && ack.burstId == activeBurstId.get()) {
+                                receivedAck.compareAndSet(null, ack)
+                                appendLog("[RX] ACK for burst ${ack.burstId} decoded (SNR4=${ack.snr4}).")
+                            }
+                        }
+                    }
+                    continue
+                }
+
+                val bandPower = ModemCore.bandEnergy(audioChunk)
+                if (noiseFloor == null) {
+                    calibrationPower += bandPower
+                    calibrationChunks++
+                    calibrationSamples += read
+                    if (calibrationSamples >= sampleRate) {
+                        noiseFloor = ModemCore.RunningNoiseFloor(calibrationPower / calibrationChunks)
+                        rxCalibrated.set(true)
+                        appendLog("[RX] Noise-floor calibration complete.")
+                    }
+                    previousGateSamples = tailSamples(previousGateSamples, audioChunk)
+                    continue
+                }
+
+                val energyDetected = noiseFloor.accept(bandPower)
+                val now = SystemClock.elapsedRealtime()
+                if (candidate && energyDetected) lastSignalAt = now
+
+                val gateSamples = concatenate(previousGateSamples, audioChunk)
+                if (!candidate && gatedListen && energyDetected && ModemCore.stage2AudioUpChirpGate(gateSamples)) {
+                    candidate = true
+                    lastSignalAt = now
+                    appendLog("[RX] Stage 1 energy and Stage 2 up-chirp gates passed.")
+                } else if (!candidate && !gatedListen && ringBuffer.size() >= sampleRate && now - lastUngatedSearchAt >= 500) {
+                    lastUngatedSearchAt = now
+                    val result = ModemCore.demodulate(ringBuffer.snapshot())
+                    reassembler.add(result.frames)
+                    if (result.info != null) {
+                        candidate = true
+                        lastSignalAt = now
+                        appendLog("[RX] Demodulator synchronized (gating disabled).")
+                    }
+                }
+
+                if (candidate && now - lastSignalAt >= BURST_QUIET_MS) {
+                    val result = ModemCore.demodulate(ringBuffer.snapshot())
+                    reassembler.add(result.frames)
+                    val validFrame = result.frames.firstOrNull { it.ok }
+                    if (validFrame != null) {
+                        val burstId = validFrame.burstId
+                        val bitmap = reassembler.bitmap(burstId)
+                        val missing = reassembler.missing(burstId)
+                        val layer0 = reassembler.layers(burstId)[0]
+                        if (layer0 != null) {
+                            val decoded = ModemCore.unpackL0(layer0)
+                            runOnUiThread {
+                                currentRecord = decoded
+                                val burstKind = if (validFrame.n == 1) "SHORT" else "LONG"
+                                lastStatus = "DECODED: Coral #${decoded.coral} ($burstKind)"
+                                logOutput += "\n----------------------------------------"
+                                logOutput += "\n[RX CRC16: PASS] ${result.frames.count { it.ok }} frame(s) decoded."
+                                logOutput += "\n  Burst Mode : $burstKind (${validFrame.n} frame${if (validFrame.n > 1) "s" else ""})"
+                                logOutput += "\n  Coral ID   : #${decoded.coral}"
+                                logOutput += "\n  Bleach     : %.2f (Index)".format(decoded.bleach)
+                                logOutput += "\n  Health     : Score H%d".format(decoded.health)
+                                logOutput += "\n  Texture    : Level T%d / 15".format(decoded.texture)
+                                result.info?.let { logOutput += "\n  Signal SNR : %.1f dB".format(it.snrDb) }
+                                logOutput += "\n  Missing    : ${if (missing.isEmpty()) "none" else missing}"
+                                logOutput += "\n----------------------------------------"
+                            }
+                        } else {
+                            appendLog("[RX] Burst ${validFrame.burstId}: ${result.frames.count { it.ok }} valid frame(s), missing $missing.")
+                        }
+                        val ackBits = ModemCore.packAck(burstId, bitmap, result.info?.snr4 ?: 0)
+                        ringBuffer.clear()
+                        candidate = false
+                        txActive.set(true)
+                        try {
+                            val ackAudio = ModemCore.modulate(listOf(ackBits), ack = true)
+                            if (audioRecord.recordingState == AudioRecord.RECORDSTATE_RECORDING) audioRecord.stop()
+                            playAudio(ackAudio)
+                            Thread.sleep(ACK_ECHO_SETTLE_MS)
+                            ringBuffer.clear()
+                            previousGateSamples = FloatArray(0)
+                            if (rxRunning.get()) {
+                                audioRecord.startRecording()
+                                drainMutedCapture(audioRecord, chunk, ringBuffer, sampleRate / 4L)
+                            }
+                            appendLog("[TX] Replied to burst $burstId with a 28-bit ACK.")
+                        } finally {
+                            txActive.set(false)
+                        }
+                    } else {
+                        appendLog("[RX] No CRC-valid frames found in synchronized burst; buffer cleared, continuing to listen.")
+                        ringBuffer.clear()
+                    }
+                    candidate = false
+                    previousGateSamples = FloatArray(0)
+                }
+
+                previousGateSamples = tailSamples(previousGateSamples, audioChunk)
+            }
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
         } catch (e: Exception) {
             runOnUiThread {
                 logOutput += "\n[RX Exception] ${e.message}"
+                lastStatus = "RX Error: ${e.message}"
             }
         } finally {
             try {
-                audioRecord.stop()
-                audioRecord.release()
-            } catch (_: Exception) {}
+                if (audioRecord.recordingState == AudioRecord.RECORDSTATE_RECORDING) audioRecord.stop()
+            } catch (e: IllegalStateException) {
+                appendLog("[RX] Error stopping microphone: ${e.message}")
+            } finally {
+                try {
+                    audioRecord.release()
+                } finally {
+                    rxCalibrated.set(false)
+                    rxRunning.set(false)
+                    runOnUiThread { isListening = false }
+                }
+            }
+        }
+    }
+
+    private fun drainMutedCapture(
+        audioRecord: AudioRecord,
+        chunk: ShortArray,
+        ringBuffer: AudioRingBuffer,
+        samplesToDrain: Long
+    ) {
+        var remaining = samplesToDrain
+        while (remaining > 0 && rxRunning.get()) {
+            val read = audioRecord.read(chunk, 0, minOf(chunk.size.toLong(), remaining).toInt())
+            check(read > 0) { "Microphone capture failed while clearing the ACK echo" }
+            ringBuffer.clear()
+            remaining -= read
+        }
+    }
+
+    private fun playAudio(audio: FloatArray) {
+        val pcm = ShortArray(audio.size) { i ->
+            (audio[i] * 32767).toInt().coerceIn(-32768, 32767).toShort()
+        }
+        val minBufferSize = AudioTrack.getMinBufferSize(
+            ModemCore.SAMPLE_RATE,
+            AudioFormat.CHANNEL_OUT_MONO,
+            AudioFormat.ENCODING_PCM_16BIT
+        )
+        val track = AudioTrack.Builder()
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_UNKNOWN)
+                    .build()
+            )
+            .setAudioFormat(
+                AudioFormat.Builder()
+                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                    .setSampleRate(ModemCore.SAMPLE_RATE)
+                    .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                    .build()
+            )
+            .setBufferSizeInBytes(maxOf(minBufferSize, pcm.size * 2))
+            .setTransferMode(AudioTrack.MODE_STATIC)
+            .build()
+
+        try {
+            check(track.write(pcm, 0, pcm.size) == pcm.size) { "AudioTrack could not queue the complete waveform" }
+            track.play()
+            val deadline = SystemClock.elapsedRealtime() + audio.size * 1000L / ModemCore.SAMPLE_RATE + 2000L
+            while (track.playbackHeadPosition < pcm.size && SystemClock.elapsedRealtime() < deadline) {
+                Thread.sleep(10)
+            }
+            check(track.playbackHeadPosition >= pcm.size) { "AudioTrack playback did not complete" }
+            track.stop()
+        } finally {
+            track.release()
+        }
+    }
+
+    private fun appendLog(message: String) {
+        runOnUiThread { logOutput += "\n$message" }
+    }
+
+    private fun updateStatus(message: String) {
+        runOnUiThread { lastStatus = message }
+    }
+
+    private fun concatenate(first: FloatArray, second: FloatArray): FloatArray = first + second
+
+    private fun tailSamples(previous: FloatArray, current: FloatArray): FloatArray {
+        val combined = previous + current
+        val length = ((1 shl ModemCore.DEFAULT_SF) * ModemCore.OVERSAMPLE).coerceAtMost(combined.size)
+        return combined.copyOfRange(combined.size - length, combined.size)
+    }
+
+    private fun packLiveL0(record: CoralRecord): IntArray {
+        val bits = ArrayList<Int>(80)
+        fun write(value: Int, count: Int) {
+            bits.addAll(ModemCore.intToBits(value.coerceIn(0, (1 shl count) - 1), count).toList())
+        }
+        fun quantize(value: Double, maximum: Double, count: Int): Int =
+            (value.coerceIn(0.0, maximum) / maximum * ((1 shl count) - 1)).roundToInt()
+        fun quantizeSignedColor(value: Double): Int =
+            (value / 4.0).roundToInt().plus(16).coerceIn(0, 31)
+
+        write(record.transect, 6)
+        write(record.coral, 8)
+        write(quantize(record.depthM, 63.5, 7), 7)
+        write(quantize(record.timeS, 5115.0, 10), 10)
+        write(quantize(record.bleach, 1.0, 6), 6)
+        write(record.health - 1, 3)
+        write(record.morph, 2)
+        for (index in 0 until 2) {
+            val color = record.colors.getOrNull(index) ?: Triple(0.0, 0.0, 0.0)
+            write(quantize(color.first, 100.0, 6), 6)
+            write(quantizeSignedColor(color.second), 5)
+            write(quantizeSignedColor(color.third), 5)
+        }
+        write(record.patch, 1)
+        write(record.evidence, 1)
+        write(record.texture, 4)
+        return bits.toIntArray()
+    }
+
+    private fun hexToBits(hex: String, bitCount: Int): IntArray {
+        require(bitCount <= hex.length * 4)
+        return IntArray(bitCount) { index ->
+            (hex[index / 4].digitToInt(16) ushr (3 - index % 4)) and 1
         }
     }
 
     override fun onDestroy() {
-        super.onDestroy()
         rxRunning.set(false)
         rxThread?.interrupt()
+        super.onDestroy()
+    }
+
+    private companion object {
+        const val RX_RING_SECONDS = 18
+        const val ACK_WINDOW_MS = 3_000L
+        const val ACK_ECHO_SETTLE_MS = 250L
+        const val BURST_QUIET_MS = 300L
     }
 }
-
-// ============================================================================
 // 6. JETPACK COMPOSE UI (SCROLLABLE LOG & JUSTIFIED LAYOUT)
 // ============================================================================
 @Composable

@@ -64,4 +64,5 @@ dependencies {
     implementation("androidx.camera:camera-view:1.3.1")
     // Unit testing golden files on JVM (no emulator needed)
     testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
 }
