@@ -1,6 +1,7 @@
 package org.reefglyph
 
 import android.Manifest
+import android.graphics.BitmapFactory
 import android.content.pm.PackageManager
 import android.media.AudioAttributes
 import android.media.AudioFormat
@@ -14,10 +15,13 @@ import android.view.KeyEvent
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -25,22 +29,52 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import org.reefglyph.ui.theme.ReefGlyphTheme
+import org.json.JSONArray
+import org.json.JSONException
+import org.json.JSONObject
+import java.io.File
+import java.io.FileOutputStream
+import java.io.IOException
+import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
 import kotlin.math.roundToInt
+
+data class LibraryCoral(
+    val id: String,
+    val filename: String,
+    val bleachIndex: Double,
+    val flagged: Boolean,
+    val healthScore: Int,
+    val textureIndex: Int,
+    val l0Hex: String,
+    val l1Hex: String,
+    val l2Hex: String,
+    val preview: ImageBitmap
+)
+
+private data class TxBurstRequest(
+    val layers: Map<Int, IntArray>,
+    val description: String,
+    val libraryId: String? = null,
+    val longUpgrade: Boolean = false
+)
 
 class AudioRingBuffer(val capacity: Int) {
     private val samples = FloatArray(capacity)
@@ -80,6 +114,15 @@ class MainActivity : ComponentActivity() {
     private var lastStatus by mutableStateOf("Ready (Idle)")
     private var currentRecord by mutableStateOf(CoralRecord())
     private var logOutput by mutableStateOf("Ready. Press TX to send, or START LISTENING.")
+    private var libraryCorals by mutableStateOf<List<LibraryCoral>>(emptyList())
+    private var selectedLibraryCoral by mutableStateOf<LibraryCoral?>(null)
+    private var manualMode by mutableStateOf(false)
+    private var receiverL0 by mutableStateOf<CoralRecord?>(null)
+    private var receiverL1 by mutableStateOf<LayerRecord?>(null)
+    private var receiverL2 by mutableStateOf<LayerRecord?>(null)
+    private var receiverAlert by mutableStateOf<String?>(null)
+    private var rxCsvPath by mutableStateOf("Unavailable")
+    private var rxCsvCount by mutableIntStateOf(0)
 
     private val rxRunning = AtomicBoolean(false)
     private val rxCalibrated = AtomicBoolean(false)
@@ -89,6 +132,7 @@ class MainActivity : ComponentActivity() {
     private val activeBurstId = AtomicInteger(-1)
     private val receivedAck = AtomicReference<ModemCore.Ack?>(null)
     private val burstCounter = AtomicInteger(0)
+    private val rxCsvLock = Any()
     private var rxThread: Thread? = null
 
     private var gatedListen = true
@@ -104,6 +148,20 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         requestPermissionsIfNeeded()
+        try {
+            libraryCorals = loadLibrary()
+            selectedLibraryCoral = libraryCorals.firstOrNull()
+        } catch (e: IOException) {
+            lastStatus = "Library load error: ${e.message}"
+            logOutput += "\n[Library Error] ${e.localizedMessage}"
+        } catch (e: JSONException) {
+            lastStatus = "Library load error: ${e.message}"
+            logOutput += "\n[Library Error] ${e.localizedMessage}"
+        } catch (e: IllegalArgumentException) {
+            lastStatus = "Library load error: ${e.message}"
+            logOutput += "\n[Library Error] ${e.localizedMessage}"
+        }
+        initializeRxCsvState()
 
         setContent {
             ReefGlyphTheme {
@@ -114,8 +172,25 @@ class MainActivity : ComponentActivity() {
                         isListening = isListening,
                         status = lastStatus,
                         log = logOutput,
+                        library = libraryCorals,
+                        selectedLibraryCoral = selectedLibraryCoral,
+                        manualMode = manualMode,
+                        receiverL0 = receiverL0,
+                        receiverL1 = receiverL1,
+                        receiverL2 = receiverL2,
+                        receiverAlert = receiverAlert,
+                        rxCsvPath = rxCsvPath,
+                        rxCsvCount = rxCsvCount,
                         onSendShort = { sendBurst(short = true) },
                         onSendLong = { sendBurst(short = false) },
+                        onSendSelectedCoral = { sendSelectedLibraryCoral() },
+                        onRunDiveQueue = { budget -> runDiveQueue(budget) },
+                        onSelectLibraryCoral = { entry ->
+                            selectedLibraryCoral = entry
+                            manualMode = false
+                        },
+                        onToggleManualMode = { manualMode = !manualMode },
+                        onDismissReceiverAlert = { receiverAlert = null },
                         onToggleListening = { toggleListening() },
                         onRecordChange = { currentRecord = it },
                         modifier = Modifier.padding(innerPadding)
@@ -147,7 +222,209 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun loadLibrary(): List<LibraryCoral> {
+        val items = assets.open("library/library.json").bufferedReader().use {
+            JSONArray(it.readText())
+        }
+        return List(items.length()) { index ->
+            val item = items.getJSONObject(index)
+            val id = item.getString("id")
+            val l0Hex = item.getString("l0_hex")
+            val l1Hex = item.getString("l1_hex")
+            val l2Hex = item.getString("l2_hex")
+            hexToBits(l0Hex, 80)
+            hexToBits(l1Hex, LayerCodec.L1_BITS)
+            hexToBits(l2Hex, LayerCodec.L2_BITS)
+            val preview = assets.open("library/$id.jpg").use { stream ->
+                BitmapFactory.decodeStream(stream)
+            } ?: throw IllegalArgumentException("Invalid preview image for $id")
+            LibraryCoral(
+                id = id,
+                filename = item.getString("filename"),
+                bleachIndex = item.getDouble("bleach_index"),
+                flagged = item.getBoolean("flagged"),
+                healthScore = item.getInt("health_score"),
+                textureIndex = item.getInt("texture_idx"),
+                l0Hex = l0Hex,
+                l1Hex = l1Hex,
+                l2Hex = l2Hex,
+                preview = preview.asImageBitmap()
+            )
+        }
+    }
+
+    private var rxCsvRows = 0
+
+    private fun initializeRxCsvState() {
+        val directory = getExternalFilesDir(null)
+        if (directory == null) {
+            rxCsvPath = "External files directory unavailable"
+            return
+        }
+        val file = File(directory, "reefglyph_rx_log.csv")
+        rxCsvPath = file.absolutePath
+        if (file.isFile) {
+            try {
+                rxCsvRows = file.bufferedReader().useLines { lines ->
+                    (lines.count() - 1).coerceAtLeast(0)
+                }
+                rxCsvCount = rxCsvRows
+            } catch (e: IOException) {
+                lastStatus = "RX CSV read error: ${e.message}"
+                logOutput += "\n[RX CSV Error] ${e.localizedMessage}"
+            }
+        }
+    }
+
+    private fun appendRxCsvRow(
+        burstId: Int,
+        mode: String,
+        info: ModemCore.SyncInfo?,
+        crcPassFrames: Int,
+        totalFrames: Int,
+        record: CoralRecord?
+    ) {
+        try {
+            val directory = getExternalFilesDir(null)
+                ?: throw IOException("External files directory is unavailable")
+            val file = File(directory, "reefglyph_rx_log.csv")
+            synchronized(rxCsvLock) {
+                FileOutputStream(file, true).bufferedWriter(Charsets.UTF_8).use { writer ->
+                    if (!file.exists() || file.length() == 0L) {
+                        writer.appendLine(
+                            "timestamp_ms,burst_id,mode,snr_db,snr4,cfo_hz,crc_pass_frames,total_frames,coral_id,bleach_idx,texture_idx"
+                        )
+                    }
+                    val cfoHz = info?.let {
+                        it.cfo * ModemCore.BANDWIDTH / (1 shl ModemCore.DEFAULT_SF)
+                    }
+                    val values = listOf(
+                        System.currentTimeMillis().toString(),
+                        burstId.toString(),
+                        mode,
+                        info?.snrDb?.let { "%.2f".format(Locale.US, it) }.orEmpty(),
+                        info?.snr4?.toString().orEmpty(),
+                        cfoHz?.let { "%.2f".format(Locale.US, it) }.orEmpty(),
+                        crcPassFrames.toString(),
+                        totalFrames.toString(),
+                        record?.coral?.toString().orEmpty(),
+                        record?.bleach?.let { "%.6f".format(Locale.US, it) }.orEmpty(),
+                        record?.texture?.toString().orEmpty()
+                    )
+                    writer.appendLine(values.joinToString(","))
+                }
+                rxCsvRows++
+                val count = rxCsvRows
+                runOnUiThread {
+                    rxCsvPath = file.absolutePath
+                    rxCsvCount = count
+                }
+            }
+        } catch (e: IOException) {
+            appendLog("[RX CSV Error] ${e.localizedMessage}")
+            updateStatus("RX CSV write error: ${e.message}")
+        } catch (e: SecurityException) {
+            appendLog("[RX CSV Error] ${e.localizedMessage}")
+            updateStatus("RX CSV write error: ${e.message}")
+        }
+    }
+
     private fun sendBurst(short: Boolean) {
+        val record = currentRecord.copy()
+        val l0 = packLiveL0(record)
+        val layers = if (short) {
+            mapOf(0 to l0)
+        } else {
+            sampleLayers + (0 to l0)
+        }
+        startBurstSequence(
+            listOf(TxBurstRequest(layers, "manual coral #${record.coral}")),
+            "Manual transmission"
+        )
+    }
+
+    private fun sendSelectedLibraryCoral() {
+        val entry = selectedLibraryCoral
+        if (entry == null) {
+            updateStatus("Select a library coral before sending.")
+            return
+        }
+        val short = !entry.flagged
+        val layers = linkedMapOf(0 to hexToBits(entry.l0Hex, 80))
+        if (!short) {
+            layers[1] = hexToBits(entry.l1Hex, LayerCodec.L1_BITS)
+            layers[2] = hexToBits(entry.l2Hex, LayerCodec.L2_BITS)
+        }
+        startBurstSequence(
+            listOf(TxBurstRequest(layers, "${entry.id} (${if (short) "SHORT" else "LONG"})")),
+            "Library transmission"
+        )
+    }
+
+    private fun runDiveQueue(budgetSec: Double) {
+        if (!budgetSec.isFinite() || budgetSec <= 0.0) {
+            updateStatus("Enter a positive airtime budget in seconds.")
+            return
+        }
+        if (libraryCorals.isEmpty()) {
+            updateStatus("The coral library is unavailable.")
+            return
+        }
+
+        val queueIdToCoral = libraryCorals.withIndex().associate { it.index to it.value }
+        val items = libraryCorals.mapIndexed { index, entry ->
+            AirtimeItem(index, entry.bleachIndex, entry.flagged)
+        }
+        val queue = try {
+            LayerCodec.buildAirtimeQueue(items, budgetSec)
+        } catch (e: IllegalArgumentException) {
+            updateStatus("Could not build dive queue: ${e.message}")
+            return
+        }
+        if (queue.isEmpty()) {
+            updateStatus("Budget is too small for a SHORT burst (${LayerCodec.SHORT_AIRTIME_SEC}s minimum).")
+            return
+        }
+
+        val upgradePreambleOverhead =
+            (ModemCore.frameSymbols(first = true) - ModemCore.frameSymbols(first = false)) *
+                (1 shl ModemCore.DEFAULT_SF).toDouble() / ModemCore.BANDWIDTH
+        val selectedQueue = mutableListOf<AirtimeQueueEntry>()
+        var plannedAirtime = 0.0
+        for (scheduled in queue) {
+            val cost = scheduled.airtimeSec +
+                if (scheduled.burst == AirtimeBurst.LONG_UPGRADE) upgradePreambleOverhead else 0.0
+            if (plannedAirtime + cost > budgetSec + 1e-12) break
+            plannedAirtime += cost
+            selectedQueue += scheduled
+        }
+        val requests = selectedQueue.map { scheduled ->
+            val entry = queueIdToCoral.getValue(scheduled.coralId)
+            val short = scheduled.burst == AirtimeBurst.SHORT
+            val layers = linkedMapOf(0 to hexToBits(entry.l0Hex, 80))
+            if (!short) {
+                layers[1] = hexToBits(entry.l1Hex, LayerCodec.L1_BITS)
+                layers[2] = hexToBits(entry.l2Hex, LayerCodec.L2_BITS)
+            }
+            TxBurstRequest(
+                layers = layers,
+                description = "${entry.id} ${if (short) "SHORT" else "LONG"}",
+                libraryId = entry.id,
+                longUpgrade = !short
+            )
+        }
+        startBurstSequence(
+            requests,
+            "Dive queue: ${requests.size} bursts, %.1f/%.1f s planned".format(
+                Locale.US,
+                plannedAirtime,
+                budgetSec
+            )
+        )
+    }
+
+    private fun startBurstSequence(requests: List<TxBurstRequest>, description: String) {
+        if (requests.isEmpty()) return
         if (!sendInProgress.compareAndSet(false, true)) return
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             requestPermissionsIfNeeded()
@@ -156,66 +433,90 @@ class MainActivity : ComponentActivity() {
             return
         }
 
-        val burstId = burstCounter.getAndUpdate { (it + 1) and 0x3F }
-        val liveL0 = packLiveL0(currentRecord.copy())
-        val layers = if (short) {
-            mapOf(0 to liveL0)
-        } else {
-            sampleLayers + (0 to liveL0)
-        }
-        val originalFrames = ModemCore.packetize(layers, burstId)
         isTransmitting = true
-        lastStatus = "Preparing ${if (short) "SHORT" else "LONG"} burst..."
+        lastStatus = "Preparing $description..."
 
         thread(name = "AcousticTxThread") {
             try {
-                var framesToSend = originalFrames
-                var complete = false
-                for (attempt in 1..ModemCore.MAX_ATTEMPTS) {
-                    activeBurstId.set(burstId)
-                    receivedAck.set(null)
-                    ackWindow.set(false)
-                    txActive.set(true)
-                    updateStatus("Transmitting ${if (short) "SHORT" else "LONG"} burst (attempt $attempt/${ModemCore.MAX_ATTEMPTS})...")
-                    appendLog("[TX] Burst $burstId: attempt $attempt, ${framesToSend.size} frame(s).")
-                    val audio = ModemCore.modulate(framesToSend)
-                    appendLog("[TX] Audio: ${audio.size} samples (%.2f s) at 48kHz".format(audio.size.toDouble() / ModemCore.SAMPLE_RATE))
-                    playAudio(audio)
-
-                    val modemTailMs = (2L * (1 shl ModemCore.DEFAULT_SF) * 1000L) / ModemCore.BANDWIDTH
-                    Thread.sleep((300L - modemTailMs).coerceAtLeast(0L))
-                    txActive.set(false)
-                    appendLog("[TX] ACK listen window opened for 3.0s.")
-
-                    val mainReceiverAvailable = rxRunning.get()
-                    ackWindow.set(mainReceiverAvailable)
-                    val ack = if (mainReceiverAvailable) {
-                        awaitMainReceiverAck(originalFrames)
+                var acknowledgedBursts = 0
+                val queueBurstIds = mutableMapOf<String, Int>()
+                val acknowledgedShorts = mutableSetOf<String>()
+                requests.forEachIndexed { index, request ->
+                    val burstId = if (request.longUpgrade) {
+                        request.libraryId?.let { queueBurstIds[it] }
+                            ?: burstCounter.getAndUpdate { (it + 1) and 0x3F }
                     } else {
-                        listenForAck(burstId, ACK_WINDOW_MS)
+                        burstCounter.getAndUpdate { (it + 1) and 0x3F }
                     }
-                    ackWindow.set(false)
-                    if (ack == null || !ack.ok || ack.burstId != burstId) {
-                        appendLog("[ARQ] No valid ACK for burst $burstId; stopping after attempt $attempt.")
-                        break
+                    if (!request.longUpgrade) {
+                        request.libraryId?.let { queueBurstIds[it] = burstId }
                     }
+                    val originalFrames = ModemCore.packetize(request.layers, burstId)
+                    val canUpgradeShort = request.longUpgrade &&
+                        request.libraryId?.let { it in acknowledgedShorts } == true
+                    var framesToSend = if (canUpgradeShort) originalFrames.drop(1) else originalFrames
+                    if (canUpgradeShort) {
+                        appendLog("[TX] ${request.description}: reusing acknowledged F0; sending F1-F8.")
+                    }
+                    var complete = false
+                    for (attempt in 1..ModemCore.MAX_ATTEMPTS) {
+                        activeBurstId.set(burstId)
+                        receivedAck.set(null)
+                        ackWindow.set(false)
+                        txActive.set(true)
+                        updateStatus("${request.description}: attempt $attempt/${ModemCore.MAX_ATTEMPTS}...")
+                        appendLog("[TX] Burst $burstId (${index + 1}/${requests.size}, ${request.description}): attempt $attempt, ${framesToSend.size} frame(s).")
+                        val audio = ModemCore.modulate(framesToSend)
+                        appendLog("[TX] Audio: ${audio.size} samples (%.2f s) at 48kHz".format(audio.size.toDouble() / ModemCore.SAMPLE_RATE))
+                        playAudio(audio)
 
-                    val missing = originalFrames.indices.filter { !ack.bitmap[it] }
-                    if (missing.isEmpty()) {
-                        complete = true
-                        appendLog("[ARQ] Burst $burstId acknowledged; all ${originalFrames.size} frame(s) received.")
-                        break
-                    }
-                    if (attempt == ModemCore.MAX_ATTEMPTS) {
-                        appendLog("[ARQ] Burst $burstId still missing frame(s) $missing after $attempt attempts.")
-                        break
-                    }
+                        val modemTailMs = (2L * (1 shl ModemCore.DEFAULT_SF) * 1000L) / ModemCore.BANDWIDTH
+                        Thread.sleep((300L - modemTailMs).coerceAtLeast(0L))
+                        txActive.set(false)
+                        appendLog("[TX] ACK listen window opened for 3.0s.")
 
-                    appendLog("[ARQ] Missing frame(s) $missing; selectively resending with burst ID $burstId.")
-                    framesToSend = ModemCore.buildSelectiveResendBurst(originalFrames, ack.bitmap, attempt)
-                    Thread.sleep(100)
+                        val mainReceiverAvailable = rxRunning.get()
+                        ackWindow.set(mainReceiverAvailable)
+                        val ack = if (mainReceiverAvailable) {
+                            awaitMainReceiverAck(originalFrames)
+                        } else {
+                            listenForAck(burstId, ACK_WINDOW_MS)
+                        }
+                        ackWindow.set(false)
+                        if (ack == null || !ack.ok || ack.burstId != burstId) {
+                            appendLog("[ARQ] No valid ACK for burst $burstId; stopping after attempt $attempt.")
+                            break
+                        }
+
+                        val missing = originalFrames.indices.filter { !ack.bitmap[it] }
+                        if (missing.isEmpty()) {
+                            complete = true
+                            acknowledgedBursts++
+                            if (!request.longUpgrade) {
+                                request.libraryId?.let { acknowledgedShorts += it }
+                            }
+                            appendLog("[ARQ] Burst $burstId acknowledged; all ${originalFrames.size} frame(s) received.")
+                            break
+                        }
+                        if (attempt == ModemCore.MAX_ATTEMPTS) {
+                            appendLog("[ARQ] Burst $burstId still missing frame(s) $missing after $attempt attempts.")
+                            break
+                        }
+
+                        appendLog("[ARQ] Missing frame(s) $missing; selectively resending with burst ID $burstId.")
+                        framesToSend = ModemCore.buildSelectiveResendBurst(originalFrames, ack.bitmap, attempt)
+                        Thread.sleep(100)
+                    }
+                    if (!complete) appendLog("[TX] ${request.description} finished without full ACK.")
                 }
-                updateStatus(if (complete) "Transmission acknowledged." else "Transmission finished; ACK incomplete or timed out.")
+                updateStatus(
+                    if (requests.size == 1) {
+                        if (acknowledgedBursts == 1) "Transmission acknowledged."
+                        else "Transmission finished; ACK incomplete or timed out."
+                    } else {
+                        "Dive queue finished: $acknowledgedBursts/${requests.size} bursts acknowledged."
+                    }
+                )
             } catch (e: InterruptedException) {
                 Thread.currentThread().interrupt()
                 updateStatus("Transmission interrupted.")
@@ -364,6 +665,8 @@ class MainActivity : ComponentActivity() {
             val chunk = ShortArray(4800)
             val ringBuffer = AudioRingBuffer(sampleRate * RX_RING_SECONDS)
             val reassembler = ModemCore.Reassembler()
+            val publishedLayerByBurst = mutableMapOf<Int, Int>()
+            val alertedBursts = mutableSetOf<Int>()
             var noiseFloor: ModemCore.RunningNoiseFloor? = null
             var calibrationPower = 0.0
             var calibrationChunks = 0
@@ -372,6 +675,10 @@ class MainActivity : ComponentActivity() {
             var candidate = false
             var lastSignalAt = 0L
             var lastUngatedSearchAt = 0L
+            var lastProgressiveDecodeAt = 0L
+            var candidateBurstId: Int? = null
+            var candidateFrameCount = 0
+            var candidateSyncInfo: ModemCore.SyncInfo? = null
 
             while (rxRunning.get()) {
                 val read = audioRecord.read(chunk, 0, chunk.size)
@@ -379,6 +686,9 @@ class MainActivity : ComponentActivity() {
                 if (txActive.get()) {
                     ringBuffer.clear()
                     candidate = false
+                    candidateBurstId = null
+                    candidateFrameCount = 0
+                    candidateSyncInfo = null
                     previousGateSamples = FloatArray(0)
                     continue
                 }
@@ -422,6 +732,10 @@ class MainActivity : ComponentActivity() {
                 if (!candidate && gatedListen && energyDetected && ModemCore.stage2AudioUpChirpGate(gateSamples)) {
                     candidate = true
                     lastSignalAt = now
+                    lastProgressiveDecodeAt = 0L
+                    candidateBurstId = null
+                    candidateFrameCount = 0
+                    candidateSyncInfo = null
                     appendLog("[RX] Stage 1 energy and Stage 2 up-chirp gates passed.")
                 } else if (!candidate && !gatedListen && ringBuffer.size() >= sampleRate && now - lastUngatedSearchAt >= 500) {
                     lastUngatedSearchAt = now
@@ -430,40 +744,104 @@ class MainActivity : ComponentActivity() {
                     if (result.info != null) {
                         candidate = true
                         lastSignalAt = now
+                        lastProgressiveDecodeAt = now
+                        candidateSyncInfo = result.info
+                        result.frames.firstOrNull { it.ok }?.let { frame ->
+                            candidateBurstId = frame.burstId
+                            candidateFrameCount = frame.n
+                        }
+                        publishReceiverProgress(
+                            result.frames,
+                            reassembler,
+                            publishedLayerByBurst,
+                            alertedBursts,
+                            result.info
+                        )
                         appendLog("[RX] Demodulator synchronized (gating disabled).")
                     }
+                }
+
+                val layer2Complete = candidateBurstId?.let {
+                    2 in reassembler.layers(it)
+                } == true
+                if (candidate && !layer2Complete && now - lastProgressiveDecodeAt >= 750) {
+                    lastProgressiveDecodeAt = now
+                    val partial = ModemCore.demodulate(ringBuffer.snapshot())
+                    reassembler.add(partial.frames)
+                    partial.info?.let { candidateSyncInfo = it }
+                    partial.frames.firstOrNull { it.ok }?.let { frame ->
+                        candidateBurstId = frame.burstId
+                        candidateFrameCount = frame.n
+                    }
+                    publishReceiverProgress(
+                        partial.frames,
+                        reassembler,
+                        publishedLayerByBurst,
+                        alertedBursts,
+                        partial.info
+                    )
                 }
 
                 if (candidate && now - lastSignalAt >= BURST_QUIET_MS) {
                     val result = ModemCore.demodulate(ringBuffer.snapshot())
                     reassembler.add(result.frames)
                     val validFrame = result.frames.firstOrNull { it.ok }
-                    if (validFrame != null) {
-                        val burstId = validFrame.burstId
+                    result.info?.let { candidateSyncInfo = it }
+                    validFrame?.let {
+                        candidateBurstId = it.burstId
+                        candidateFrameCount = it.n
+                    }
+                    publishReceiverProgress(
+                        result.frames,
+                        reassembler,
+                        publishedLayerByBurst,
+                        alertedBursts,
+                        result.info
+                    )
+                    val burstId = validFrame?.burstId ?: candidateBurstId
+                    if (burstId != null) {
                         val bitmap = reassembler.bitmap(burstId)
                         val missing = reassembler.missing(burstId)
                         val layer0 = reassembler.layers(burstId)[0]
+                        val decoded = layer0?.let { ModemCore.unpackL0(it) }
+                        val totalFrames = validFrame?.n ?: candidateFrameCount
+                        val burstKind = if (totalFrames == 1) "SHORT" else "LONG"
+                        val logMode = when {
+                            missing.isNotEmpty() -> "${burstKind}_TIMEOUT"
+                            else -> burstKind
+                        }
+                        appendRxCsvRow(
+                            burstId = burstId,
+                            mode = logMode,
+                            info = result.info ?: candidateSyncInfo,
+                            crcPassFrames = bitmap.count { it },
+                            totalFrames = totalFrames,
+                            record = decoded
+                        )
                         if (layer0 != null) {
-                            val decoded = ModemCore.unpackL0(layer0)
+                            val decodedRecord = decoded ?: ModemCore.unpackL0(layer0)
                             runOnUiThread {
-                                currentRecord = decoded
-                                val burstKind = if (validFrame.n == 1) "SHORT" else "LONG"
-                                lastStatus = "DECODED: Coral #${decoded.coral} ($burstKind)"
+                                currentRecord = decodedRecord
+                                lastStatus = "DECODED: Coral #${decodedRecord.coral} ($burstKind)"
                                 logOutput += "\n----------------------------------------"
-                                logOutput += "\n[RX CRC16: PASS] ${result.frames.count { it.ok }} frame(s) decoded."
-                                logOutput += "\n  Burst Mode : $burstKind (${validFrame.n} frame${if (validFrame.n > 1) "s" else ""})"
-                                logOutput += "\n  Coral ID   : #${decoded.coral}"
-                                logOutput += "\n  Bleach     : %.2f (Index)".format(decoded.bleach)
-                                logOutput += "\n  Health     : Score H%d".format(decoded.health)
-                                logOutput += "\n  Texture    : Level T%d / 15".format(decoded.texture)
+                                logOutput += "\n[RX CRC16: PASS] ${bitmap.count { it }} of $totalFrames frame(s) decoded."
+                                logOutput += "\n  Burst Mode : $burstKind ($totalFrames frame${if (totalFrames != 1) "s" else ""})"
+                                logOutput += "\n  Coral ID   : #${decodedRecord.coral}"
+                                logOutput += "\n  Bleach     : %.2f (Index)".format(decodedRecord.bleach)
+                                logOutput += "\n  Health     : Score H%d".format(decodedRecord.health)
+                                logOutput += "\n  Texture    : Level T%d / 15".format(decodedRecord.texture)
                                 result.info?.let { logOutput += "\n  Signal SNR : %.1f dB".format(it.snrDb) }
                                 logOutput += "\n  Missing    : ${if (missing.isEmpty()) "none" else missing}"
                                 logOutput += "\n----------------------------------------"
                             }
                         } else {
-                            appendLog("[RX] Burst ${validFrame.burstId}: ${result.frames.count { it.ok }} valid frame(s), missing $missing.")
+                            appendLog("[RX] Burst $burstId: ${bitmap.count { it }} valid frame(s), missing $missing.")
                         }
-                        val ackBits = ModemCore.packAck(burstId, bitmap, result.info?.snr4 ?: 0)
+                        val ackBits = ModemCore.packAck(
+                            burstId,
+                            bitmap,
+                            (result.info ?: candidateSyncInfo)?.snr4 ?: 0
+                        )
                         ringBuffer.clear()
                         candidate = false
                         txActive.set(true)
@@ -484,9 +862,20 @@ class MainActivity : ComponentActivity() {
                         }
                     } else {
                         appendLog("[RX] No CRC-valid frames found in synchronized burst; buffer cleared, continuing to listen.")
+                        appendRxCsvRow(
+                            burstId = -1,
+                            mode = "TIMEOUT",
+                            info = result.info ?: candidateSyncInfo,
+                            crcPassFrames = 0,
+                            totalFrames = 0,
+                            record = null
+                        )
                         ringBuffer.clear()
                     }
                     candidate = false
+                    candidateBurstId = null
+                    candidateFrameCount = 0
+                    candidateSyncInfo = null
                     previousGateSamples = FloatArray(0)
                 }
 
@@ -511,6 +900,52 @@ class MainActivity : ComponentActivity() {
                     rxCalibrated.set(false)
                     rxRunning.set(false)
                     runOnUiThread { isListening = false }
+                }
+            }
+        }
+    }
+
+    private fun publishReceiverProgress(
+        frames: List<ModemCore.Frame>,
+        reassembler: ModemCore.Reassembler,
+        publishedLayerByBurst: MutableMap<Int, Int>,
+        alertedBursts: MutableSet<Int>,
+        info: ModemCore.SyncInfo?
+    ) {
+        frames.filter { it.ok }.map { it.burstId }.distinct().forEach { burstId ->
+            val layers = reassembler.layers(burstId)
+            val level = when {
+                2 in layers -> 2
+                1 in layers -> 1
+                0 in layers -> 0
+                else -> -1
+            }
+            if (level <= (publishedLayerByBurst[burstId] ?: -1)) return@forEach
+            val layer0 = layers[0] ?: return@forEach
+            val decodedL0 = ModemCore.unpackL0(layer0)
+            val decodedL1 = layers[1]?.let { LayerCodec.unpackL1(it) }
+            val decodedL2 = layers[2]?.let { LayerCodec.unpackL2(it) }
+            val showAlert = alertedBursts.add(burstId)
+            publishedLayerByBurst[burstId] = level
+            runOnUiThread {
+                receiverL0 = decodedL0
+                receiverL1 = decodedL1
+                receiverL2 = decodedL2
+                currentRecord = decodedL0
+                lastStatus = when (level) {
+                    0 -> "Coral #${decodedL0.coral}: L0 decoded"
+                    1 -> "Coral #${decodedL0.coral}: L1 contour decoded"
+                    else -> "Coral #${decodedL0.coral}: L2 thumbnail decoded"
+                }
+                if (showAlert) {
+                    val decision = if (decodedL0.evidence != 0) "flagged" else "healthy"
+                    receiverAlert = "Coral #${decodedL0.coral} is $decision (bleach %.2f).".format(
+                        Locale.US,
+                        decodedL0.bleach
+                    )
+                }
+                info?.let {
+                    logOutput += "\n[RX] Burst $burstId: L$level complete; SNR %.1f dB.".format(it.snrDb)
                 }
             }
         }
@@ -618,7 +1053,10 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun hexToBits(hex: String, bitCount: Int): IntArray {
-        require(bitCount <= hex.length * 4)
+        require(bitCount > 0 && hex.length >= (bitCount + 3) / 4) {
+            "Expected at least ${(bitCount + 3) / 4} hex characters for $bitCount bits"
+        }
+        require(hex.all { it.digitToIntOrNull(16) != null }) { "Layer data must be hexadecimal" }
         return IntArray(bitCount) { index ->
             (hex[index / 4].digitToInt(16) ushr (3 - index % 4)) and 1
         }
@@ -646,14 +1084,29 @@ fun ReefGlyphMainScreen(
     isListening: Boolean,
     status: String,
     log: String,
+    library: List<LibraryCoral>,
+    selectedLibraryCoral: LibraryCoral?,
+    manualMode: Boolean,
+    receiverL0: CoralRecord?,
+    receiverL1: LayerRecord?,
+    receiverL2: LayerRecord?,
+    receiverAlert: String?,
+    rxCsvPath: String,
+    rxCsvCount: Int,
     onSendShort: () -> Unit,
     onSendLong: () -> Unit,
+    onSendSelectedCoral: () -> Unit,
+    onRunDiveQueue: (Double) -> Unit,
+    onSelectLibraryCoral: (LibraryCoral) -> Unit,
+    onToggleManualMode: () -> Unit,
+    onDismissReceiverAlert: () -> Unit,
     onToggleListening: () -> Unit,
     onRecordChange: (CoralRecord) -> Unit,
     modifier: Modifier = Modifier
 ) {
     val screenScrollState = rememberScrollState()
     val terminalScrollState = rememberScrollState()
+    var budgetText by remember { mutableStateOf("120") }
 
     LaunchedEffect(log) {
         terminalScrollState.animateScrollTo(terminalScrollState.maxValue)
@@ -680,7 +1133,6 @@ fun ReefGlyphMainScreen(
 
         Spacer(modifier = Modifier.height(12.dp))
 
-        // Coral Glyph Badge Display
         Card(
             shape = RoundedCornerShape(12.dp),
             colors = CardDefaults.cardColors(containerColor = Color(0xFF1E293B)),
@@ -688,47 +1140,88 @@ fun ReefGlyphMainScreen(
         ) {
             Column(modifier = Modifier.padding(12.dp)) {
                 Text(
-                    text = "CORAL EVIDENCE GLYPH",
+                    text = "CORAL LIBRARY & TRIAGE",
                     fontSize = 11.sp,
                     fontWeight = FontWeight.Bold,
                     color = Color(0xFF94A3B8)
                 )
                 Spacer(modifier = Modifier.height(8.dp))
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(130.dp)
-                        .background(Color.Black, RoundedCornerShape(8.dp))
-                        .border(1.dp, Color(0xFF334155), RoundedCornerShape(8.dp)),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Canvas(modifier = Modifier.fillMaxSize()) {
-                        val isBleached = record.bleach > 0.3
-                        val badgeColor = if (isBleached) Color(0xFFDC2626) else Color(0xFF16A34A)
-                        drawRect(color = badgeColor, size = Size(size.width, 44f))
-
-                        val col1 = Color(
-                            red = (record.colors[0].first / 100.0).toFloat().coerceIn(0f, 1f),
-                            green = 0.5f,
-                            blue = 0.6f
-                        )
-                        val col2 = Color(
-                            red = (record.colors[1].first / 100.0).toFloat().coerceIn(0f, 1f),
-                            green = 0.7f,
-                            blue = 0.4f
-                        )
-                        drawCircle(color = col1, radius = 26f, center = Offset(size.width * 0.35f, size.height * 0.65f))
-                        drawCircle(color = col2, radius = 26f, center = Offset(size.width * 0.65f, size.height * 0.65f))
-                        drawCircle(color = Color.White, radius = 28f, center = Offset(size.width * 0.5f, size.height * 0.65f), style = Stroke(2f))
+                LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    items(library, key = { it.id }) { coral ->
+                        val selected = coral.id == selectedLibraryCoral?.id
+                        Column(
+                            modifier = Modifier
+                                .width(112.dp)
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(if (selected) Color(0xFF334155) else Color(0xFF0F172A))
+                                .clickable { onSelectLibraryCoral(coral) }
+                                .padding(6.dp)
+                        ) {
+                            Image(
+                                bitmap = coral.preview,
+                                contentDescription = "Preview of ${coral.id}",
+                                contentScale = ContentScale.Crop,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(70.dp)
+                                    .clip(RoundedCornerShape(6.dp))
+                            )
+                            Text(coral.id, color = Color.White, fontSize = 11.sp, maxLines = 1)
+                            Text(
+                                if (coral.flagged) "FLAGGED" else "HEALTHY",
+                                color = if (coral.flagged) Color(0xFFF87171) else Color(0xFF4ADE80),
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
                     }
+                }
+                selectedLibraryCoral?.let { coral ->
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Image(
+                            bitmap = coral.preview,
+                            contentDescription = "Selected coral crop ${coral.id}",
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier
+                                .size(width = 116.dp, height = 88.dp)
+                                .clip(RoundedCornerShape(8.dp))
+                        )
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(coral.id, color = Color.White, fontWeight = FontWeight.Bold)
+                            Text(coral.filename, color = Color(0xFF94A3B8), fontSize = 10.sp, maxLines = 1)
+                            Text(
+                                "${if (coral.flagged) "Flagged · LONG" else "Healthy · SHORT"}  " +
+                                    "bleach %.2f · H%d · T%d".format(
+                                        Locale.US,
+                                        coral.bleachIndex,
+                                        coral.healthScore,
+                                        coral.textureIndex
+                                    ),
+                                color = if (coral.flagged) Color(0xFFF87171) else Color(0xFF4ADE80),
+                                fontSize = 11.sp
+                            )
+                            Button(
+                                onClick = onSendSelectedCoral,
+                                enabled = !isTransmitting,
+                                modifier = Modifier.padding(top = 4.dp)
+                            ) {
+                                Text(
+                                    if (coral.flagged) "SEND LONG (14.08s)" else "SEND SHORT (2.13s)",
+                                    fontSize = 11.sp
+                                )
+                            }
+                        }
+                    }
+                }
+                TextButton(onClick = onToggleManualMode) {
                     Text(
-                        text = "coral ${record.coral}  bleach %.2f  H%d  T%d".format(record.bleach, record.health, record.texture),
-                        color = Color.White,
-                        fontSize = 13.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        modifier = Modifier
-                            .align(Alignment.TopStart)
-                            .padding(start = 12.dp, top = 2.dp)
+                        if (manualMode) "Back to coral library controls" else "Use manual sliders",
+                        color = Color(0xFF38BDF8)
                     )
                 }
             }
@@ -736,7 +1229,6 @@ fun ReefGlyphMainScreen(
 
         Spacer(modifier = Modifier.height(12.dp))
 
-        // Telemetry Sliders
         Card(
             shape = RoundedCornerShape(12.dp),
             colors = CardDefaults.cardColors(containerColor = Color(0xFF1E293B)),
@@ -744,56 +1236,139 @@ fun ReefGlyphMainScreen(
         ) {
             Column(modifier = Modifier.padding(12.dp)) {
                 Text(
-                    text = "TRANSMITTER PARAMETERS",
+                    text = "RECEIVED GLYPH",
                     fontSize = 11.sp,
                     fontWeight = FontWeight.Bold,
                     color = Color(0xFF94A3B8)
                 )
+                Spacer(modifier = Modifier.height(8.dp))
+                CoralGlyphCanvas(
+                    l0 = receiverL0,
+                    l1 = receiverL1,
+                    l2 = receiverL2,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(170.dp)
+                        .clip(RoundedCornerShape(8.dp))
+                )
+                Text(
+                    text = when {
+                        receiverL2 != null -> "L0 + L1 contour + L2 thumbnail received"
+                        receiverL1 != null -> "L0 + L1 contour received"
+                        receiverL0 != null -> "L0 decoded; waiting for higher layers"
+                        else -> "Waiting for a CRC-valid F0 (L0) frame"
+                    },
+                    color = Color(0xFF94A3B8),
+                    fontSize = 11.sp,
+                    modifier = Modifier.padding(top = 5.dp)
+                )
+            }
+        }
 
-                Spacer(modifier = Modifier.height(4.dp))
-                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                    Text(text = "Bleach: %.2f".format(record.bleach), color = Color.White, fontSize = 13.sp)
-                    Slider(
-                        value = record.bleach.toFloat(),
-                        onValueChange = { onRecordChange(record.copy(bleach = it.toDouble())) },
-                        valueRange = 0f..1f,
-                        modifier = Modifier.width(200.dp)
+        Spacer(modifier = Modifier.height(12.dp))
+
+        if (manualMode) {
+            Card(
+                shape = RoundedCornerShape(12.dp),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF1E293B)),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(modifier = Modifier.padding(12.dp)) {
+                    Text(
+                        text = "TRANSMITTER PARAMETERS",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = Color(0xFF94A3B8)
                     )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                        Text(text = "Bleach: %.2f".format(record.bleach), color = Color.White, fontSize = 13.sp)
+                        Slider(
+                            value = record.bleach.toFloat(),
+                            onValueChange = { onRecordChange(record.copy(bleach = it.toDouble())) },
+                            valueRange = 0f..1f,
+                            modifier = Modifier.width(200.dp)
+                        )
+                    }
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                        Text(text = "Texture: ${record.texture} / 15", color = Color(0xFF38BDF8), fontSize = 13.sp)
+                        Slider(
+                            value = record.texture.toFloat(),
+                            onValueChange = { onRecordChange(record.copy(texture = it.toInt())) },
+                            valueRange = 0f..15f,
+                            steps = 14,
+                            modifier = Modifier.width(200.dp)
+                        )
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(
+                    onClick = onSendShort,
+                    enabled = !isTransmitting,
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0284C7)),
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Text("TX SHORT (2.13s)")
                 }
 
-                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                    Text(text = "Texture: ${record.texture} / 15", color = Color(0xFF38BDF8), fontSize = 13.sp)
-                    Slider(
-                        value = record.texture.toFloat(),
-                        onValueChange = { onRecordChange(record.copy(texture = it.toInt())) },
-                        valueRange = 0f..15f,
-                        steps = 14,
-                        modifier = Modifier.width(200.dp)
-                    )
+                Button(
+                    onClick = onSendLong,
+                    enabled = !isTransmitting,
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2563EB)),
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Text("TX LONG (14.08s)")
                 }
             }
         }
 
         Spacer(modifier = Modifier.height(12.dp))
 
-        // Control Buttons
-        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Button(
-                onClick = onSendShort,
-                enabled = !isTransmitting,
-                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0284C7)),
-                modifier = Modifier.weight(1f)
-            ) {
-                Text("TX SHORT (2.13s)")
-            }
-
-            Button(
-                onClick = onSendLong,
-                enabled = !isTransmitting,
-                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2563EB)),
-                modifier = Modifier.weight(1f)
-            ) {
-                Text("TX LONG (14.08s)")
+        Card(
+            shape = RoundedCornerShape(12.dp),
+            colors = CardDefaults.cardColors(containerColor = Color(0xFF1E293B)),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column(modifier = Modifier.padding(12.dp)) {
+                Text(
+                    text = "AIRTIME-BUDGET SCHEDULER",
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = Color(0xFF94A3B8)
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    OutlinedTextField(
+                        value = budgetText,
+                        onValueChange = { value ->
+                            if (value.matches(Regex("""\d*\.?\d*"""))) budgetText = value
+                        },
+                        label = { Text("Budget (seconds)") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                        singleLine = true,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Button(
+                        onClick = { budgetText.toDoubleOrNull()?.let(onRunDiveQueue) },
+                        enabled = !isTransmitting &&
+                            library.isNotEmpty() &&
+                            (budgetText.toDoubleOrNull()?.let { it.isFinite() && it > 0.0 } == true)
+                    ) {
+                        Text("Run Dive Queue")
+                    }
+                }
+                Text(
+                    text = "Schedules SHORT bursts within budget, then prioritizes flagged LONG upgrades.",
+                    color = Color(0xFF94A3B8),
+                    fontSize = 10.sp
+                )
             }
         }
 
@@ -815,6 +1390,14 @@ fun ReefGlyphMainScreen(
 
         Spacer(modifier = Modifier.height(6.dp))
 
+        Text(
+            text = "RX CSV: $rxCsvPath ($rxCsvCount rows)",
+            color = Color(0xFF94A3B8),
+            fontSize = 10.sp
+        )
+
+        Spacer(modifier = Modifier.height(6.dp))
+
         Box(
             modifier = Modifier
                 .fillMaxWidth()
@@ -832,5 +1415,18 @@ fun ReefGlyphMainScreen(
                 lineHeight = 16.sp
             )
         }
+    }
+
+    receiverAlert?.let { message ->
+        AlertDialog(
+            onDismissRequest = onDismissReceiverAlert,
+            title = { Text("Coral received") },
+            text = { Text(message) },
+            confirmButton = {
+                TextButton(onClick = onDismissReceiverAlert) {
+                    Text("OK")
+                }
+            }
+        )
     }
 }

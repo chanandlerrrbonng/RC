@@ -110,6 +110,35 @@ class ModemCoreTest {
         assertEquals(42, decoded.coral)
     }
 
+    @Test
+    fun layerCodecRoundTripsManifestSamplesBitExactly() {
+        val manifest = JSONObject(String(resourceBytes("golden/manifest.json"), StandardCharsets.UTF_8))
+            .getJSONObject("sample_layers")
+        val sampleL1 = hexToBits(manifest.getString("L1"), LayerCodec.L1_BITS)
+        val sampleL2 = hexToBits(manifest.getString("L2"), LayerCodec.L2_BITS)
+
+        assertArrayEquals(sampleL1, LayerCodec.packL1(LayerCodec.unpackL1(sampleL1)))
+        assertArrayEquals(sampleL2, LayerCodec.packL2(LayerCodec.unpackL2(sampleL2)))
+    }
+
+    @Test
+    fun airtimeQueueUsesBudgetAndUpgradesHighestBleachFirst() {
+        val items = listOf(
+            AirtimeItem(coralId = 1, bleachIndex = 0.2, flagged = true),
+            AirtimeItem(coralId = 2, bleachIndex = 0.9, flagged = true),
+            AirtimeItem(coralId = 3, bleachIndex = 0.6, flagged = true),
+            AirtimeItem(coralId = 4, bleachIndex = 0.1, flagged = false)
+        )
+        val budget = items.size * LayerCodec.SHORT_AIRTIME_SEC + LayerCodec.LONG_UPGRADE_AIRTIME_SEC + 0.01
+
+        val queue = LayerCodec.buildAirtimeQueue(items, budget)
+        val upgrades = queue.filter { it.burst == AirtimeBurst.LONG_UPGRADE }
+
+        assertEquals(items.size, queue.count { it.burst == AirtimeBurst.SHORT })
+        assertEquals(listOf(2), upgrades.map { it.coralId })
+        assertTrue(queue.sumOf { it.airtimeSec } <= budget)
+    }
+
     private fun JSONArray.toStringList(): List<String> =
         List(length()) { index -> getString(index) }
 
