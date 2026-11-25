@@ -1,7 +1,9 @@
 package org.reefglyph
 
 import android.Manifest
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Rect
 import android.content.pm.PackageManager
 import android.media.AudioAttributes
 import android.media.AudioFormat
@@ -21,7 +23,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyRow
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -46,6 +48,7 @@ import org.reefglyph.ui.theme.ReefGlyphTheme
 import org.json.JSONArray
 import org.json.JSONException
 import org.json.JSONObject
+import org.opencv.core.CvException
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
@@ -116,6 +119,8 @@ class MainActivity : ComponentActivity() {
     private var logOutput by mutableStateOf("Ready. Press TX to send, or START LISTENING.")
     private var libraryCorals by mutableStateOf<List<LibraryCoral>>(emptyList())
     private var selectedLibraryCoral by mutableStateOf<LibraryCoral?>(null)
+    private var selectedAnalysis by mutableStateOf<AnalysisResult?>(null)
+    private var analyzerBusy by mutableStateOf(false)
     private var manualMode by mutableStateOf(false)
     private var receiverL0 by mutableStateOf<CoralRecord?>(null)
     private var receiverL1 by mutableStateOf<LayerRecord?>(null)
@@ -129,6 +134,7 @@ class MainActivity : ComponentActivity() {
     private val txActive = AtomicBoolean(false)
     private val ackWindow = AtomicBoolean(false)
     private val sendInProgress = AtomicBoolean(false)
+    private val analyzerRunning = AtomicBoolean(false)
     private val activeBurstId = AtomicInteger(-1)
     private val receivedAck = AtomicReference<ModemCore.Ack?>(null)
     private val burstCounter = AtomicInteger(0)
@@ -174,6 +180,8 @@ class MainActivity : ComponentActivity() {
                         log = logOutput,
                         library = libraryCorals,
                         selectedLibraryCoral = selectedLibraryCoral,
+                        selectedAnalysis = selectedAnalysis,
+                        analyzerBusy = analyzerBusy,
                         manualMode = manualMode,
                         receiverL0 = receiverL0,
                         receiverL1 = receiverL1,
@@ -184,9 +192,12 @@ class MainActivity : ComponentActivity() {
                         onSendShort = { sendBurst(short = true) },
                         onSendLong = { sendBurst(short = false) },
                         onSendSelectedCoral = { sendSelectedLibraryCoral() },
+                        onAnalyzeSelected = { analyzeSelectedLibraryCrop() },
+                        onVerify20Crops = { verifyLibraryCrops() },
                         onRunDiveQueue = { budget -> runDiveQueue(budget) },
                         onSelectLibraryCoral = { entry ->
                             selectedLibraryCoral = entry
+                            selectedAnalysis = null
                             manualMode = false
                         },
                         onToggleManualMode = { manualMode = !manualMode },
@@ -250,6 +261,15 @@ class MainActivity : ComponentActivity() {
                 l2Hex = l2Hex,
                 preview = preview.asImageBitmap()
             )
+        }
+    }
+
+    private fun libraryCropName(entry: LibraryCoral): String {
+        val index = libraryCorals.indexOfFirst { it.id == entry.id }
+        return if (index >= 0) {
+            "Crop %02d".format(Locale.US, index + 1)
+        } else {
+            "Crop ${entry.id.substringAfterLast('-')}"
         }
     }
 
@@ -332,13 +352,24 @@ class MainActivity : ComponentActivity() {
     private fun sendBurst(short: Boolean) {
         val record = currentRecord.copy()
         val l0 = packLiveL0(record)
-        val layers = if (short) {
-            mapOf(0 to l0)
-        } else {
-            sampleLayers + (0 to l0)
+        val layers = linkedMapOf(0 to l0)
+        if (!short) {
+            val selectedLayers = selectedLibraryCoral?.let { entry ->
+                mapOf(
+                    1 to hexToBits(entry.l1Hex, LayerCodec.L1_BITS),
+                    2 to hexToBits(entry.l2Hex, LayerCodec.L2_BITS)
+                )
+            } ?: sampleLayers
+            layers.putAll(selectedLayers)
         }
         startBurstSequence(
-            listOf(TxBurstRequest(layers, "manual coral #${record.coral}")),
+            listOf(
+                TxBurstRequest(
+                    layers,
+                    selectedLibraryCoral?.let { "${libraryCropName(it)} manual coral #${record.coral}" }
+                        ?: "manual coral #${record.coral}"
+                )
+            ),
             "Manual transmission"
         )
     }
@@ -349,16 +380,158 @@ class MainActivity : ComponentActivity() {
             updateStatus("Select a library coral before sending.")
             return
         }
-        val short = !entry.flagged
-        val layers = linkedMapOf(0 to hexToBits(entry.l0Hex, 80))
+        val analysis = selectedAnalysis
+        val analyzedRecord = analysis?.let {
+            currentRecord.copy(
+                bleach = it.bleachIndex,
+                health = it.healthScore,
+                morph = 3,
+                colors = it.dominantColors.map { color -> Triple(color.l, color.a, color.b) },
+                evidence = if (it.flagged) 1 else 0,
+                texture = it.textureBin
+            )
+        }
+        val short = !(analysis?.flagged ?: entry.flagged)
+        val l0 = analyzedRecord?.let { packLiveL0(it) } ?: hexToBits(entry.l0Hex, 80)
+        val layers = linkedMapOf(0 to l0)
         if (!short) {
             layers[1] = hexToBits(entry.l1Hex, LayerCodec.L1_BITS)
             layers[2] = hexToBits(entry.l2Hex, LayerCodec.L2_BITS)
         }
+        if (analysis != null) {
+            appendLog("[TX] ${libraryCropName(entry)}: on-device L0 triage; using this crop's library L1/L2 when flagged.")
+        }
         startBurstSequence(
-            listOf(TxBurstRequest(layers, "${entry.id} (${if (short) "SHORT" else "LONG"})")),
+            listOf(TxBurstRequest(layers, "${libraryCropName(entry)} (${if (short) "SHORT" else "LONG"})")),
             "Library transmission"
         )
+    }
+
+    private fun analyzeSelectedLibraryCrop() {
+        val entry = selectedLibraryCoral
+        if (entry == null) {
+            updateStatus("Select a library coral before running on-device analysis.")
+            return
+        }
+        if (!analyzerRunning.compareAndSet(false, true)) return
+        analyzerBusy = true
+        thread(name = "CoralL0Analysis") {
+            try {
+                CoralAnalyzer.initialize(applicationContext)
+                val bitmap = loadLibraryBitmap(entry)
+                val result = try {
+                    CoralAnalyzer.analyzeL0(bitmap, libraryAnalysisRect(bitmap))
+                } finally {
+                    bitmap.recycle()
+                }
+                runOnUiThread {
+                    if (selectedLibraryCoral?.id == entry.id) selectedAnalysis = result
+                    val cropName = libraryCropName(entry)
+                    lastStatus = "$cropName: on-device L0 ${if (result.flagged) "flagged" else "not flagged"}"
+                    logOutput += "\n[L0 On-Device] $cropName: bleach %.3f, H%d, T%d, %s, %.2f ms."
+                        .format(
+                            Locale.US,
+                            result.bleachIndex,
+                            result.healthScore,
+                            result.textureBin,
+                            if (result.flagged) "FLAGGED" else "clear",
+                            result.elapsedMs
+                        )
+                    logOutput += "\n[L0 On-Device] Dominant Lab: " +
+                        result.dominantColors.joinToString(" / ") {
+                            "(%.1f, %.1f, %.1f)".format(Locale.US, it.l, it.a, it.b)
+                        } + "; this crop's precomputed L1/L2 provide contour and thumbnail detail on LONG."
+                }
+            } catch (e: IOException) {
+                reportAnalyzerFailure("On-device analysis", e)
+            } catch (e: JSONException) {
+                reportAnalyzerFailure("On-device analysis", e)
+            } catch (e: IllegalArgumentException) {
+                reportAnalyzerFailure("On-device analysis", e)
+            } catch (e: IllegalStateException) {
+                reportAnalyzerFailure("On-device analysis", e)
+            } catch (e: CvException) {
+                reportAnalyzerFailure("On-device analysis", e)
+            } finally {
+                analyzerRunning.set(false)
+                runOnUiThread { analyzerBusy = false }
+            }
+        }
+    }
+
+    private fun verifyLibraryCrops() {
+        if (libraryCorals.size < 20) {
+            updateStatus("Verification needs at least 20 library crops.")
+            return
+        }
+        runLibraryAnalyzerBenchmark(libraryCorals.take(20), passes = 1)
+    }
+
+    private fun runLibraryAnalyzerBenchmark(entries: List<LibraryCoral>, passes: Int = 1) {
+        require(entries.isNotEmpty()) { "Benchmark requires library crops" }
+        require(passes > 0) { "Benchmark pass count must be positive" }
+        if (!analyzerRunning.compareAndSet(false, true)) return
+        analyzerBusy = true
+        thread(name = "CoralL0Benchmark") {
+            try {
+                CoralAnalyzer.initialize(applicationContext)
+                val latencies = ArrayList<Double>(entries.size * passes)
+                var agreements = 0
+                repeat(passes) {
+                    entries.forEach { entry ->
+                        val bitmap = loadLibraryBitmap(entry)
+                        val result = try {
+                            CoralAnalyzer.analyzeL0(bitmap, libraryAnalysisRect(bitmap))
+                        } finally {
+                            bitmap.recycle()
+                        }
+                        latencies += result.elapsedMs
+                        if (result.flagged == entry.flagged) agreements++
+                    }
+                }
+                val meanMs = latencies.average()
+                val maxMs = latencies.maxOrNull() ?: 0.0
+                val agreementRate = agreements * 100.0 / latencies.size
+                runOnUiThread {
+                    lastStatus = "L0 verification: %.1f%% flag agreement".format(Locale.US, agreementRate)
+                    logOutput += "\n[L0 Verify] ${entries.size} crops x $passes pass(es): " +
+                        "%.1f%% flag agreement vs library.json; mean %.2f ms, max %.2f ms (%d analyses)."
+                            .format(Locale.US, agreementRate, meanMs, maxMs, latencies.size)
+                }
+            } catch (e: IOException) {
+                reportAnalyzerFailure("L0 verification", e)
+            } catch (e: JSONException) {
+                reportAnalyzerFailure("L0 verification", e)
+            } catch (e: IllegalArgumentException) {
+                reportAnalyzerFailure("L0 verification", e)
+            } catch (e: IllegalStateException) {
+                reportAnalyzerFailure("L0 verification", e)
+            } catch (e: CvException) {
+                reportAnalyzerFailure("L0 verification", e)
+            } finally {
+                analyzerRunning.set(false)
+                runOnUiThread { analyzerBusy = false }
+            }
+        }
+    }
+
+    private fun loadLibraryBitmap(entry: LibraryCoral): Bitmap =
+        assets.open("library/${entry.id}.jpg").use { stream ->
+            BitmapFactory.decodeStream(stream)
+                ?: throw IllegalArgumentException("Invalid library crop for ${entry.id}")
+        }
+
+    private fun libraryAnalysisRect(bitmap: Bitmap): Rect {
+        val left = bitmap.width / 10
+        val top = bitmap.height / 10
+        return Rect(left, top, left + bitmap.width * 8 / 10, top + bitmap.height * 8 / 10)
+    }
+
+    private fun reportAnalyzerFailure(operation: String, error: Exception) {
+        runOnUiThread {
+            lastStatus = "$operation failed: ${error.message}"
+            logOutput += "\n[$operation Error] ${error.localizedMessage ?: error.message}"
+        }
     }
 
     private fun runDiveQueue(budgetSec: Double) {
@@ -408,7 +581,7 @@ class MainActivity : ComponentActivity() {
             }
             TxBurstRequest(
                 layers = layers,
-                description = "${entry.id} ${if (short) "SHORT" else "LONG"}",
+                description = "${libraryCropName(entry)} ${if (short) "SHORT" else "LONG"}",
                 libraryId = entry.id,
                 longUpgrade = !short
             )
@@ -1086,6 +1259,8 @@ fun ReefGlyphMainScreen(
     log: String,
     library: List<LibraryCoral>,
     selectedLibraryCoral: LibraryCoral?,
+    selectedAnalysis: AnalysisResult?,
+    analyzerBusy: Boolean,
     manualMode: Boolean,
     receiverL0: CoralRecord?,
     receiverL1: LayerRecord?,
@@ -1096,6 +1271,8 @@ fun ReefGlyphMainScreen(
     onSendShort: () -> Unit,
     onSendLong: () -> Unit,
     onSendSelectedCoral: () -> Unit,
+    onAnalyzeSelected: () -> Unit,
+    onVerify20Crops: () -> Unit,
     onRunDiveQueue: (Double) -> Unit,
     onSelectLibraryCoral: (LibraryCoral) -> Unit,
     onToggleManualMode: () -> Unit,
@@ -1147,7 +1324,7 @@ fun ReefGlyphMainScreen(
                 )
                 Spacer(modifier = Modifier.height(8.dp))
                 LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    items(library, key = { it.id }) { coral ->
+                    itemsIndexed(library, key = { _, coral -> coral.id }) { index, coral ->
                         val selected = coral.id == selectedLibraryCoral?.id
                         Column(
                             modifier = Modifier
@@ -1159,14 +1336,19 @@ fun ReefGlyphMainScreen(
                         ) {
                             Image(
                                 bitmap = coral.preview,
-                                contentDescription = "Preview of ${coral.id}",
+                                contentDescription = "Preview of crop ${index + 1}",
                                 contentScale = ContentScale.Crop,
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .height(70.dp)
                                     .clip(RoundedCornerShape(6.dp))
                             )
-                            Text(coral.id, color = Color.White, fontSize = 11.sp, maxLines = 1)
+                            Text(
+                                "Crop %02d".format(Locale.US, index + 1),
+                                color = Color.White,
+                                fontSize = 11.sp,
+                                maxLines = 1
+                            )
                             Text(
                                 if (coral.flagged) "FLAGGED" else "HEALTHY",
                                 color = if (coral.flagged) Color(0xFFF87171) else Color(0xFF4ADE80),
@@ -1177,6 +1359,8 @@ fun ReefGlyphMainScreen(
                     }
                 }
                 selectedLibraryCoral?.let { coral ->
+                    val cropIndex = library.indexOfFirst { it.id == coral.id } + 1
+                    val triageFlagged = selectedAnalysis?.flagged ?: coral.flagged
                     Spacer(modifier = Modifier.height(8.dp))
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -1185,35 +1369,61 @@ fun ReefGlyphMainScreen(
                     ) {
                         Image(
                             bitmap = coral.preview,
-                            contentDescription = "Selected coral crop ${coral.id}",
+                            contentDescription = "Selected crop $cropIndex",
                             contentScale = ContentScale.Crop,
                             modifier = Modifier
                                 .size(width = 116.dp, height = 88.dp)
                                 .clip(RoundedCornerShape(8.dp))
                         )
                         Column(modifier = Modifier.weight(1f)) {
-                            Text(coral.id, color = Color.White, fontWeight = FontWeight.Bold)
+                            Text(
+                                "Crop %02d".format(Locale.US, cropIndex.coerceAtLeast(1)),
+                                color = Color.White,
+                                fontWeight = FontWeight.Bold
+                            )
                             Text(coral.filename, color = Color(0xFF94A3B8), fontSize = 10.sp, maxLines = 1)
                             Text(
-                                "${if (coral.flagged) "Flagged · LONG" else "Healthy · SHORT"}  " +
+                                "${if (triageFlagged) "Flagged · LONG" else "Healthy · SHORT"}  " +
                                     "bleach %.2f · H%d · T%d".format(
                                         Locale.US,
-                                        coral.bleachIndex,
-                                        coral.healthScore,
-                                        coral.textureIndex
+                                        selectedAnalysis?.bleachIndex ?: coral.bleachIndex,
+                                        selectedAnalysis?.healthScore ?: coral.healthScore,
+                                        selectedAnalysis?.textureBin ?: coral.textureIndex
                                     ),
-                                color = if (coral.flagged) Color(0xFFF87171) else Color(0xFF4ADE80),
+                                color = if (triageFlagged) Color(0xFFF87171) else Color(0xFF4ADE80),
                                 fontSize = 11.sp
                             )
                             Button(
                                 onClick = onSendSelectedCoral,
-                                enabled = !isTransmitting,
+                                enabled = !isTransmitting && !analyzerBusy,
                                 modifier = Modifier.padding(top = 4.dp)
                             ) {
                                 Text(
-                                    if (coral.flagged) "SEND LONG (14.08s)" else "SEND SHORT (2.13s)",
+                                    if (triageFlagged) "SEND LONG (14.08s)" else "SEND SHORT (2.13s)",
                                     fontSize = 11.sp
                                 )
+                            }
+                            Row(
+                                modifier = Modifier.padding(top = 4.dp),
+                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                OutlinedButton(
+                                    onClick = onAnalyzeSelected,
+                                    enabled = !analyzerBusy,
+                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
+                                ) {
+                                    Text(
+                                        if (analyzerBusy) "Analyzing..." else "Analyze On-Device",
+                                        fontSize = 10.sp
+                                    )
+                                }
+                                OutlinedButton(
+                                    onClick = onVerify20Crops,
+                                    enabled = !analyzerBusy,
+                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
+                                ) {
+                                    Text("Verify 20 Crops", fontSize = 10.sp)
+                                }
                             }
                         }
                     }
@@ -1253,9 +1463,9 @@ fun ReefGlyphMainScreen(
                 )
                 Text(
                     text = when {
-                        receiverL2 != null -> "L0 + L1 contour + L2 thumbnail received"
-                        receiverL1 != null -> "L0 + L1 contour received"
-                        receiverL0 != null -> "L0 decoded; waiting for higher layers"
+                        receiverL2 != null -> "Full glyph: L0 summary + L1 contour + L2 colour thumbnail"
+                        receiverL1 != null -> "L0 summary + L1 contour received; waiting for L2 thumbnail"
+                        receiverL0 != null -> "L0 summary only: no contour or image thumbnail"
                         else -> "Waiting for a CRC-valid F0 (L0) frame"
                     },
                     color = Color(0xFF94A3B8),

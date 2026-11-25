@@ -52,52 +52,78 @@ fun CoralGlyphCanvas(
         val left = (size.width - glyphWidth) / 2f
         val top = badgeHeight + padding + (availableHeight - glyphHeight) / 2f
 
-        val contour = if (l1?.efd != null) {
-            contourPath(l1, left, top, glyphWidth, glyphHeight)
-        } else {
-            placeholderPath(left, top, glyphWidth, glyphHeight)
-        }
-
-        clipPath(contour) {
-            if (l1?.efd != null && l2?.thumb != null && l2.palette != null) {
-                val thumbnail = l2.thumb!!
-                val palette = l2.palette!!
-                for (y in 0 until 16) {
-                    for (x in 0 until 16) {
-                        val paletteIndex = thumbnail[y * 16 + x].coerceIn(0, 3)
-                        drawRect(
-                            color = palette[paletteIndex].toComposeColor(),
-                            topLeft = androidx.compose.ui.geometry.Offset(
-                                left + glyphWidth * x / 16f,
-                                top + glyphHeight * y / 16f
-                            ),
-                            size = androidx.compose.ui.geometry.Size(
-                                glyphWidth / 16f + 0.5f,
-                                glyphHeight / 16f + 0.5f
-                            )
-                        )
-                    }
+        if (l1?.efd == null) {
+            val swatchSize = min(frameSize * 0.25f, with(density) { 56.dp.toPx() })
+            val swatchGap = padding
+            val swatchLeft = (size.width - swatchSize * 2 - swatchGap) / 2f
+            val swatchTop = badgeHeight + padding + (availableHeight - swatchSize) / 2f
+            drawRect(
+                color = colors[0],
+                topLeft = androidx.compose.ui.geometry.Offset(swatchLeft, swatchTop),
+                size = androidx.compose.ui.geometry.Size(swatchSize, swatchSize)
+            )
+            drawRect(
+                color = colors[1],
+                topLeft = androidx.compose.ui.geometry.Offset(swatchLeft + swatchSize + swatchGap, swatchTop),
+                size = androidx.compose.ui.geometry.Size(swatchSize, swatchSize)
+            )
+            drawIntoCanvas { canvas ->
+                val paint = NativePaint(NativePaint.ANTI_ALIAS_FLAG).apply {
+                    color = android.graphics.Color.DKGRAY
+                    this.textSize = with(density) { 11.dp.toPx() }
+                    typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
                 }
-            } else {
-                drawRect(
-                    color = colors[0],
-                    topLeft = androidx.compose.ui.geometry.Offset(left, top),
-                    size = androidx.compose.ui.geometry.Size(glyphWidth / 2f, glyphHeight)
-                )
-                drawRect(
-                    color = colors[1],
-                    topLeft = androidx.compose.ui.geometry.Offset(left + glyphWidth / 2f, top),
-                    size = androidx.compose.ui.geometry.Size(glyphWidth / 2f, glyphHeight)
+                val label = "L0 SUMMARY ONLY"
+                canvas.nativeCanvas.drawText(
+                    label,
+                    (size.width - paint.measureText(label)) / 2f,
+                    badgeHeight + padding + paint.textSize,
+                    paint
                 )
             }
+        } else {
+            val contour = contourPath(l1, left, top, glyphWidth, glyphHeight)
+            clipPath(contour) {
+                if (l2?.thumb != null && l2.palette != null) {
+                    val thumbnail = l2.thumb!!
+                    val palette = l2.palette!!
+                    for (y in 0 until 16) {
+                        for (x in 0 until 16) {
+                            val paletteIndex = thumbnail[y * 16 + x].coerceIn(0, 3)
+                            drawRect(
+                                color = palette[paletteIndex].toComposeColor(),
+                                topLeft = androidx.compose.ui.geometry.Offset(
+                                    left + glyphWidth * x / 16f,
+                                    top + glyphHeight * y / 16f
+                                ),
+                                size = androidx.compose.ui.geometry.Size(
+                                    glyphWidth / 16f + 0.5f,
+                                    glyphHeight / 16f + 0.5f
+                                )
+                            )
+                        }
+                    }
+                } else {
+                    drawRect(
+                        color = colors[0],
+                        topLeft = androidx.compose.ui.geometry.Offset(left, top),
+                        size = androidx.compose.ui.geometry.Size(glyphWidth / 2f, glyphHeight)
+                    )
+                    drawRect(
+                        color = colors[1],
+                        topLeft = androidx.compose.ui.geometry.Offset(left + glyphWidth / 2f, top),
+                        size = androidx.compose.ui.geometry.Size(glyphWidth / 2f, glyphHeight)
+                    )
+                }
+            }
+            drawPath(
+                path = contour,
+                color = Color.Black.copy(alpha = 0.35f),
+                style = Stroke(width = with(density) { 1.dp.toPx() })
+            )
         }
-        drawPath(
-            path = contour,
-            color = Color.Black.copy(alpha = 0.35f),
-            style = Stroke(width = with(density) { 1.dp.toPx() })
-        )
 
-        val badgeColor = if (l0.bleach > 0.3) Color(0xFFDC2626) else Color(0xFF16A34A)
+        val badgeColor = if (l0.evidence != 0) Color(0xFFDC2626) else Color(0xFF16A34A)
         drawRect(color = badgeColor, size = androidx.compose.ui.geometry.Size(size.width, badgeHeight))
         drawIntoCanvas { canvas ->
             val paint = NativePaint(NativePaint.ANTI_ALIAS_FLAG).apply {
@@ -137,25 +163,6 @@ private fun contourPath(
             val y = top + point[1].coerceIn(0.0, 1.0).toFloat() * height
             if (index == 0) moveTo(x, y) else lineTo(x, y)
         }
-        close()
-    }
-}
-
-private fun placeholderPath(left: Float, top: Float, width: Float, height: Float): Path {
-    fun x(value: Float) = left + width * value
-    fun y(value: Float) = top + height * value
-    return Path().apply {
-        moveTo(x(0.50f), y(0.06f))
-        cubicTo(x(0.64f), y(0.04f), x(0.65f), y(0.18f), x(0.75f), y(0.17f))
-        cubicTo(x(0.91f), y(0.14f), x(0.94f), y(0.30f), x(0.86f), y(0.39f))
-        cubicTo(x(0.99f), y(0.48f), x(0.90f), y(0.59f), x(0.82f), y(0.62f))
-        cubicTo(x(0.91f), y(0.76f), x(0.77f), y(0.88f), x(0.67f), y(0.80f))
-        cubicTo(x(0.60f), y(0.95f), x(0.48f), y(0.91f), x(0.46f), y(0.80f))
-        cubicTo(x(0.36f), y(0.94f), x(0.25f), y(0.84f), x(0.30f), y(0.73f))
-        cubicTo(x(0.14f), y(0.81f), x(0.06f), y(0.67f), x(0.17f), y(0.57f))
-        cubicTo(x(0.04f), y(0.48f), x(0.10f), y(0.35f), x(0.21f), y(0.32f))
-        cubicTo(x(0.15f), y(0.20f), x(0.31f), y(0.11f), x(0.40f), y(0.20f))
-        cubicTo(x(0.42f), y(0.10f), x(0.46f), y(0.06f), x(0.50f), y(0.06f))
         close()
     }
 }
